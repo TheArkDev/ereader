@@ -240,16 +240,52 @@ app.post('/admin/books', requireAuth, requireAdmin, async (c) => {
   });
 });
 
-// Edit a book's metadata (title/author/description). Does not touch files.
+// Edit a book: metadata (title/author/description), and optionally replace
+// its cover image and/or the book file itself. multipart/form-data — any
+// field can be omitted to leave that part unchanged.
 app.patch('/admin/books/:id', requireAuth, requireAdmin, async (c) => {
   const id = c.req.param('id');
-  const body = await c.req.json<{ title?: string; author?: string | null; description?: string | null }>();
-
-  const existing = await c.env.DB.prepare('SELECT id FROM books WHERE id = ?').bind(id).first();
+  const existing = await c.env.DB.prepare('SELECT file_key, cover_key, format FROM books WHERE id = ?')
+    .bind(id)
+    .first<{ file_key: string; cover_key: string | null; format: string }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
 
-  await c.env.DB.prepare('UPDATE books SET title = COALESCE(?, title), author = ?, description = ? WHERE id = ?')
-    .bind(body.title ?? null, body.author ?? null, body.description ?? null, id)
+  const form = await c.req.formData();
+  const title = (form.get('title') as string | null)?.trim() || null;
+  const author = (form.get('author') as string | null)?.trim() || null;
+  const description = (form.get('description') as string | null)?.trim() || null;
+  const bookFile = form.get('bookFile') as File | null;
+  const coverFile = form.get('coverFile') as File | null;
+
+  let fileSizeUpdate: number | null = null;
+  if (bookFile && bookFile.size > 0) {
+    // Reuse the existing key (same extension/format) so nothing else needs updating.
+    const bytes = await bookFile.arrayBuffer();
+    await c.env.FILES.put(existing.file_key, bytes, {
+      httpMetadata: { contentType: existing.format === 'pdf' ? 'application/pdf' : 'application/epub+zip' },
+    });
+    fileSizeUpdate = bytes.byteLength;
+  }
+
+  let coverKeyUpdate: string | null | undefined = undefined; // undefined = don't touch
+  if (coverFile && coverFile.size > 0) {
+    const coverKey = existing.cover_key ?? `covers/${id}.jpg`;
+    await c.env.FILES.put(coverKey, await coverFile.arrayBuffer(), {
+      httpMetadata: { contentType: coverFile.type || 'image/jpeg' },
+    });
+    coverKeyUpdate = coverKey;
+  }
+
+  await c.env.DB.prepare(
+    `UPDATE books SET
+       title = COALESCE(?, title),
+       author = ?,
+       description = ?,
+       file_size = COALESCE(?, file_size),
+       cover_key = COALESCE(?, cover_key)
+     WHERE id = ?`
+  )
+    .bind(title, author, description, fileSizeUpdate, coverKeyUpdate ?? null, id)
     .run();
 
   return c.json({ ok: true });
@@ -273,6 +309,15 @@ app.delete('/admin/books/:id', requireAuth, requireAdmin, async (c) => {
 });
 
 // ---------- Reading progress ----------
+app.get('/progress', requireAuth, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    'SELECT book_id, position, updated_at FROM reading_progress WHERE user_id = ?'
+  )
+    .bind(c.get('userId'))
+    .all();
+  return c.json({ progress: results });
+});
+
 app.get('/progress/:bookId', requireAuth, async (c) => {
   const row = await c.env.DB.prepare('SELECT position, updated_at FROM reading_progress WHERE user_id = ? AND book_id = ?')
     .bind(c.get('userId'), c.req.param('bookId'))
