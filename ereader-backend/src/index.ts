@@ -118,16 +118,41 @@ app.get('/auth/me', requireAuth, async (c) => {
 
 // ---------- Book routes ----------
 app.get('/books', requireAuth, async (c) => {
-  const { results } = await c.env.DB.prepare(
-    'SELECT id, title, author, description, format, cover_key, created_at FROM books ORDER BY created_at DESC'
-  ).all();
+  const q = c.req.query('q')?.trim();
+  const category = c.req.query('category')?.trim();
+
+  let sql = 'SELECT id, title, author, description, format, cover_key, category, created_at FROM books';
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+
+  if (q) {
+    conditions.push('(LOWER(title) LIKE ? OR LOWER(author) LIKE ?)');
+    const like = `%${q.toLowerCase()}%`;
+    params.push(like, like);
+  }
+  if (category) {
+    conditions.push('category = ?');
+    params.push(category);
+  }
+  if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
+  sql += ' ORDER BY created_at DESC';
+
+  const { results } = await c.env.DB.prepare(sql).bind(...params).all();
   return c.json({ books: results });
+});
+
+// Distinct category list, for populating filter chips in the app.
+app.get('/categories', requireAuth, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    "SELECT DISTINCT category FROM books WHERE category IS NOT NULL AND category != '' ORDER BY category"
+  ).all();
+  return c.json({ categories: results.map((r: any) => r.category as string) });
 });
 
 app.get('/books/:id', requireAuth, async (c) => {
   const id = c.req.param('id');
   const book = await c.env.DB.prepare(
-    'SELECT id, title, author, description, format, cover_key, file_size, created_at FROM books WHERE id = ?'
+    'SELECT id, title, author, description, format, cover_key, category, file_size, created_at FROM books WHERE id = ?'
   )
     .bind(id)
     .first();
@@ -195,7 +220,7 @@ async function streamR2Object(c: any, key: string, defaultContentType: string) {
 // All routes below require the caller to be an admin (see requireAdmin above).
 
 // Upload a new book. Expects multipart/form-data:
-//   title (required), author, description, format ('pdf' | 'epub', required)
+//   title (required), author, description, category, format ('pdf' | 'epub', required)
 //   bookFile (required, the actual .pdf/.epub)
 //   coverFile (optional image)
 app.post('/admin/books', requireAuth, requireAdmin, async (c) => {
@@ -204,6 +229,7 @@ app.post('/admin/books', requireAuth, requireAdmin, async (c) => {
   const title = (form.get('title') as string | null)?.trim();
   const author = (form.get('author') as string | null)?.trim() || null;
   const description = (form.get('description') as string | null)?.trim() || null;
+  const category = (form.get('category') as string | null)?.trim() || null;
   const format = form.get('format') as string | null;
   const bookFile = form.get('bookFile') as File | null;
   const coverFile = form.get('coverFile') as File | null;
@@ -229,20 +255,24 @@ app.post('/admin/books', requireAuth, requireAdmin, async (c) => {
   }
 
   await c.env.DB.prepare(
-    `INSERT INTO books (id, title, author, description, format, file_key, cover_key, file_size)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO books (id, title, author, description, category, format, file_key, cover_key, file_size)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
-    .bind(id, title, author, description, format, fileKey, coverKey, bookBytes.byteLength)
+    .bind(id, title, author, description, category, format, fileKey, coverKey, bookBytes.byteLength)
     .run();
 
   return c.json({
-    book: { id, title, author, description, format, cover_key: coverKey, file_size: bookBytes.byteLength },
+    book: { id, title, author, description, category, format, cover_key: coverKey, file_size: bookBytes.byteLength },
   });
 });
 
-// Edit a book: metadata (title/author/description), and optionally replace
-// its cover image and/or the book file itself. multipart/form-data — any
-// field can be omitted to leave that part unchanged.
+// Edit a book: metadata (title/author/description/category), and optionally
+// replace its cover image and/or the book file itself. multipart/form-data.
+//
+// Duplicate guard: if another book (different id) already has the same
+// title AND the same author, case-insensitively, the update is REJECTED
+// with 409 rather than saved — the caller offers deleting the existing
+// duplicate instead, then retries.
 app.patch('/admin/books/:id', requireAuth, requireAdmin, async (c) => {
   const id = c.req.param('id');
   const existing = await c.env.DB.prepare('SELECT file_key, cover_key, format FROM books WHERE id = ?')
@@ -254,8 +284,29 @@ app.patch('/admin/books/:id', requireAuth, requireAdmin, async (c) => {
   const title = (form.get('title') as string | null)?.trim() || null;
   const author = (form.get('author') as string | null)?.trim() || null;
   const description = (form.get('description') as string | null)?.trim() || null;
+  const category = (form.get('category') as string | null)?.trim() || null;
   const bookFile = form.get('bookFile') as File | null;
   const coverFile = form.get('coverFile') as File | null;
+
+  if (title) {
+    const dupe = await c.env.DB.prepare(
+      `SELECT id, title, author FROM books
+       WHERE id != ? AND LOWER(title) = LOWER(?) AND LOWER(COALESCE(author, '')) = LOWER(COALESCE(?, ''))`
+    )
+      .bind(id, title, author ?? '')
+      .first<{ id: string; title: string; author: string | null }>();
+
+    if (dupe) {
+      return c.json(
+        {
+          error: 'duplicate',
+          message: `"${dupe.title}"${dupe.author ? ` by ${dupe.author}` : ''} already exists in the library.`,
+          duplicate: { id: dupe.id, title: dupe.title, author: dupe.author },
+        },
+        409
+      );
+    }
+  }
 
   let fileSizeUpdate: number | null = null;
   if (bookFile && bookFile.size > 0) {
@@ -281,11 +332,12 @@ app.patch('/admin/books/:id', requireAuth, requireAdmin, async (c) => {
        title = COALESCE(?, title),
        author = ?,
        description = ?,
+       category = ?,
        file_size = COALESCE(?, file_size),
        cover_key = COALESCE(?, cover_key)
      WHERE id = ?`
   )
-    .bind(title, author, description, fileSizeUpdate, coverKeyUpdate ?? null, id)
+    .bind(title, author, description, category, fileSizeUpdate, coverKeyUpdate ?? null, id)
     .run();
 
   return c.json({ ok: true });
