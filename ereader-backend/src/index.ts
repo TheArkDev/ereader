@@ -67,7 +67,7 @@ app.post('/auth/signup', async (c) => {
     .run();
 
   const token = await signToken(id, email, c.env.JWT_SECRET);
-  return c.json({ token, user: { id, email, displayName: body.displayName ?? null } });
+  return c.json({ token, user: { id, email, displayName: body.displayName ?? null, is_admin: false } });
 });
 
 app.post('/auth/login', async (c) => {
@@ -77,10 +77,17 @@ app.post('/auth/login', async (c) => {
   if (!email || !password) return c.json({ error: 'Email and password required' }, 400);
 
   const user = await c.env.DB.prepare(
-    'SELECT id, email, password_hash, password_salt, display_name FROM users WHERE email = ?'
+    'SELECT id, email, password_hash, password_salt, display_name, is_admin FROM users WHERE email = ?'
   )
     .bind(email)
-    .first<{ id: string; email: string; password_hash: string; password_salt: string; display_name: string | null }>();
+    .first<{
+      id: string;
+      email: string;
+      password_hash: string;
+      password_salt: string;
+      display_name: string | null;
+      is_admin: number;
+    }>();
 
   if (!user) return c.json({ error: 'Invalid credentials' }, 401);
 
@@ -88,7 +95,10 @@ app.post('/auth/login', async (c) => {
   if (!ok) return c.json({ error: 'Invalid credentials' }, 401);
 
   const token = await signToken(user.id, user.email, c.env.JWT_SECRET);
-  return c.json({ token, user: { id: user.id, email: user.email, displayName: user.display_name } });
+  return c.json({
+    token,
+    user: { id: user.id, email: user.email, displayName: user.display_name, is_admin: user.is_admin === 1 },
+  });
 });
 
 app.post('/auth/logout', requireAuth, async (c) => {
