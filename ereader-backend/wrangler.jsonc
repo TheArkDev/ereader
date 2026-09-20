@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "ereader",
+  "name": "ereader-backend",
   "main": "src/index.ts",
   "compatibility_date": "2024-11-01",
   "compatibility_flags": ["nodejs_compat"],
@@ -36,6 +36,9 @@
 
   "vars": {
     // Override this in production with: wrangler secret put JWT_SECRET
-    "JWT_SECRET": "dev-only-change-me"
+    "JWT_SECRET": "dev-only-change-me",
+    // Get a free API key at https://resend.com — override with:
+    // wrangler secret put RESEND_API_KEY
+    "RESEND_API_KEY": "dev-only-change-me"
   }
 }
