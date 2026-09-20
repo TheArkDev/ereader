@@ -7,6 +7,7 @@ export interface Env {
   FILES: R2Bucket;
   KV: KVNamespace;
   JWT_SECRET: string;
+  RESEND_API_KEY: string;
 }
 
 type Vars = { userId: string; email: string };
@@ -114,6 +115,129 @@ app.get('/auth/me', requireAuth, async (c) => {
     .first<{ id: string; email: string; display_name: string | null; is_admin: number }>();
   if (!user) return c.json({ error: 'Not found' }, 404);
   return c.json({ user: { ...user, is_admin: user.is_admin === 1 } });
+});
+
+// ---------- Password reset ----------
+// Flow: app calls POST /auth/forgot-password -> we email a link that opens
+// GET /reset-password?token=... (a plain HTML page served by this same
+// Worker, since the app has no custom domain to deep-link into) -> the
+// person sets a new password there -> POST /reset-password completes it.
+// Reset tokens live in KV with a 1-hour TTL and are single-use.
+
+async function sendEmail(env: Env, to: string, subject: string, html: string): Promise<void> {
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      // Resend's shared testing sender — works with no domain verification.
+      // Swap for your own verified domain's address once you have one.
+      from: 'ereader <onboarding@resend.dev>',
+      to,
+      subject,
+      html,
+    }),
+  });
+  if (!res.ok) {
+    console.error('Resend API error', res.status, await res.text());
+  }
+}
+
+app.post('/auth/forgot-password', async (c) => {
+  const body = await c.req.json<{ email?: string }>();
+  const email = body.email?.trim().toLowerCase();
+
+  // Always respond the same way whether or not the email exists, so this
+  // endpoint can't be used to discover which emails are registered.
+  const genericResponse = c.json({ message: 'If that email is registered, a reset link has been sent.' });
+  if (!email) return genericResponse;
+
+  const user = await c.env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first<{ id: string }>();
+  if (!user) return genericResponse;
+
+  const token = crypto.randomUUID();
+  await c.env.KV.put(`reset:${token}`, user.id, { expirationTtl: 3600 }); // 1 hour
+
+  const resetUrl = `${new URL(c.req.url).origin}/reset-password?token=${token}`;
+  await sendEmail(
+    c.env,
+    email,
+    'Reset your ereader password',
+    `<p>Someone requested a password reset for this email's ereader account.</p>
+     <p><a href="${resetUrl}">Click here to set a new password</a> (link expires in 1 hour).</p>
+     <p>If you didn't request this, you can safely ignore this email.</p>`
+  );
+
+  return genericResponse;
+});
+
+const RESET_PAGE_STYLES = `
+  body { font-family: Georgia, serif; background: #FBF8F3; color: #1B1B1F; display: flex;
+         justify-content: center; padding: 48px 20px; }
+  .card { max-width: 380px; width: 100%; }
+  h1 { font-size: 22px; margin-bottom: 8px; }
+  p { color: #5c5850; font-size: 14px; }
+  input { width: 100%; padding: 12px 14px; margin-top: 6px; margin-bottom: 16px; border-radius: 10px;
+          border: 1px solid rgba(0,0,0,0.15); font-size: 15px; box-sizing: border-box; }
+  label { font-size: 13px; font-weight: 600; }
+  button { width: 100%; padding: 14px; border-radius: 10px; border: none; background: #5E3B26;
+           color: white; font-size: 15px; font-weight: 600; cursor: pointer; }
+  .error { color: #b3261e; font-size: 13px; margin-bottom: 12px; }
+`;
+
+app.get('/reset-password', async (c) => {
+  const token = c.req.query('token') ?? '';
+  const userId = token ? await c.env.KV.get(`reset:${token}`) : null;
+
+  if (!userId) {
+    return c.html(`<html><head><style>${RESET_PAGE_STYLES}</style></head><body><div class="card">
+      <h1>Link expired</h1>
+      <p>This password reset link is invalid or has expired. Go back to the app and request a new one.</p>
+    </div></body></html>`);
+  }
+
+  return c.html(`<html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>${RESET_PAGE_STYLES}</style></head><body><div class="card">
+    <h1>Set a new password</h1>
+    <p>Choose a new password for your ereader account.</p>
+    <form method="POST" action="/reset-password">
+      <input type="hidden" name="token" value="${token}">
+      <label>New password</label>
+      <input type="password" name="password" minlength="8" required>
+      <button type="submit">Reset password</button>
+    </form>
+  </div></body></html>`);
+});
+
+app.post('/reset-password', async (c) => {
+  const form = await c.req.formData();
+  const token = form.get('token') as string | null;
+  const password = form.get('password') as string | null;
+
+  const userId = token ? await c.env.KV.get(`reset:${token}`) : null;
+
+  if (!userId) {
+    return c.html(`<html><head><style>${RESET_PAGE_STYLES}</style></head><body><div class="card">
+      <h1>Link expired</h1><p>Go back to the app and request a new reset link.</p>
+    </div></body></html>`);
+  }
+  if (!password || password.length < 8) {
+    return c.html(`<html><head><style>${RESET_PAGE_STYLES}</style></head><body><div class="card">
+      <h1>Password too short</h1><p>Use the link in your email again and choose a password with at least 8 characters.</p>
+    </div></body></html>`);
+  }
+
+  const { hash, salt } = await hashPassword(password);
+  await c.env.DB.prepare('UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?')
+    .bind(hash, salt, userId)
+    .run();
+  await c.env.KV.delete(`reset:${token}`); // single-use
+
+  return c.html(`<html><head><style>${RESET_PAGE_STYLES}</style></head><body><div class="card">
+    <h1>Password updated</h1><p>You can now log in with your new password in the app.</p>
+  </div></body></html>`);
 });
 
 // ---------- Book routes ----------
@@ -386,6 +510,92 @@ app.put('/progress/:bookId', requireAuth, async (c) => {
   )
     .bind(c.get('userId'), c.req.param('bookId'), body.position)
     .run();
+  return c.json({ ok: true });
+});
+
+// ---------- Annotations (highlights, underlines, notes) ----------
+// Personal to each user — never shared between readers of the same book.
+
+app.get('/annotations/:bookId', requireAuth, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, type, color, cfi, page, selected_text, note, created_at
+     FROM annotations WHERE user_id = ? AND book_id = ? ORDER BY created_at ASC`
+  )
+    .bind(c.get('userId'), c.req.param('bookId'))
+    .all();
+  return c.json({ annotations: results });
+});
+
+app.post('/annotations', requireAuth, async (c) => {
+  const body = await c.req.json<{
+    bookId: string;
+    type: 'highlight' | 'underline' | 'note';
+    color?: string;
+    cfi?: string;
+    page?: number;
+    selectedText?: string;
+    note?: string;
+  }>();
+
+  if (!body.bookId || !body.type) return c.json({ error: 'bookId and type are required' }, 400);
+  if (!['highlight', 'underline', 'note'].includes(body.type)) return c.json({ error: 'invalid type' }, 400);
+
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO annotations (id, user_id, book_id, type, color, cfi, page, selected_text, note)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      id,
+      c.get('userId'),
+      body.bookId,
+      body.type,
+      body.color ?? null,
+      body.cfi ?? null,
+      body.page ?? null,
+      body.selectedText ?? null,
+      body.note ?? null
+    )
+    .run();
+
+  return c.json({
+    annotation: {
+      id,
+      type: body.type,
+      color: body.color ?? null,
+      cfi: body.cfi ?? null,
+      page: body.page ?? null,
+      selected_text: body.selectedText ?? null,
+      note: body.note ?? null,
+    },
+  });
+});
+
+app.patch('/annotations/:id', requireAuth, async (c) => {
+  const id = c.req.param('id');
+  const existing = await c.env.DB.prepare('SELECT user_id FROM annotations WHERE id = ?')
+    .bind(id)
+    .first<{ user_id: string }>();
+  if (!existing) return c.json({ error: 'Not found' }, 404);
+  if (existing.user_id !== c.get('userId')) return c.json({ error: 'Forbidden' }, 403);
+
+  const body = await c.req.json<{ color?: string; note?: string }>();
+  await c.env.DB.prepare('UPDATE annotations SET color = COALESCE(?, color), note = COALESCE(?, note) WHERE id = ?')
+    .bind(body.color ?? null, body.note ?? null, id)
+    .run();
+
+  return c.json({ ok: true });
+});
+
+app.delete('/annotations/:id', requireAuth, async (c) => {
+  const id = c.req.param('id');
+  const existing = await c.env.DB.prepare('SELECT user_id FROM annotations WHERE id = ?')
+    .bind(id)
+    .first<{ user_id: string }>();
+  if (!existing) return c.json({ error: 'Not found' }, 404);
+  if (existing.user_id !== c.get('userId')) return c.json({ error: 'Forbidden' }, 403);
+
+  await c.env.DB.prepare('DELETE FROM annotations WHERE id = ?').bind(id).run();
   return c.json({ ok: true });
 });
 
