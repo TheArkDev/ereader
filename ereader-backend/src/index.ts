@@ -389,6 +389,92 @@ app.put('/progress/:bookId', requireAuth, async (c) => {
   return c.json({ ok: true });
 });
 
+// ---------- Annotations (highlights, underlines, notes) ----------
+// Personal to each user — never shared between readers of the same book.
+
+app.get('/annotations/:bookId', requireAuth, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, type, color, cfi, page, selected_text, note, created_at
+     FROM annotations WHERE user_id = ? AND book_id = ? ORDER BY created_at ASC`
+  )
+    .bind(c.get('userId'), c.req.param('bookId'))
+    .all();
+  return c.json({ annotations: results });
+});
+
+app.post('/annotations', requireAuth, async (c) => {
+  const body = await c.req.json<{
+    bookId: string;
+    type: 'highlight' | 'underline' | 'note';
+    color?: string;
+    cfi?: string;
+    page?: number;
+    selectedText?: string;
+    note?: string;
+  }>();
+
+  if (!body.bookId || !body.type) return c.json({ error: 'bookId and type are required' }, 400);
+  if (!['highlight', 'underline', 'note'].includes(body.type)) return c.json({ error: 'invalid type' }, 400);
+
+  const id = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO annotations (id, user_id, book_id, type, color, cfi, page, selected_text, note)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      id,
+      c.get('userId'),
+      body.bookId,
+      body.type,
+      body.color ?? null,
+      body.cfi ?? null,
+      body.page ?? null,
+      body.selectedText ?? null,
+      body.note ?? null
+    )
+    .run();
+
+  return c.json({
+    annotation: {
+      id,
+      type: body.type,
+      color: body.color ?? null,
+      cfi: body.cfi ?? null,
+      page: body.page ?? null,
+      selected_text: body.selectedText ?? null,
+      note: body.note ?? null,
+    },
+  });
+});
+
+app.patch('/annotations/:id', requireAuth, async (c) => {
+  const id = c.req.param('id');
+  const existing = await c.env.DB.prepare('SELECT user_id FROM annotations WHERE id = ?')
+    .bind(id)
+    .first<{ user_id: string }>();
+  if (!existing) return c.json({ error: 'Not found' }, 404);
+  if (existing.user_id !== c.get('userId')) return c.json({ error: 'Forbidden' }, 403);
+
+  const body = await c.req.json<{ color?: string; note?: string }>();
+  await c.env.DB.prepare('UPDATE annotations SET color = COALESCE(?, color), note = COALESCE(?, note) WHERE id = ?')
+    .bind(body.color ?? null, body.note ?? null, id)
+    .run();
+
+  return c.json({ ok: true });
+});
+
+app.delete('/annotations/:id', requireAuth, async (c) => {
+  const id = c.req.param('id');
+  const existing = await c.env.DB.prepare('SELECT user_id FROM annotations WHERE id = ?')
+    .bind(id)
+    .first<{ user_id: string }>();
+  if (!existing) return c.json({ error: 'Not found' }, 404);
+  if (existing.user_id !== c.get('userId')) return c.json({ error: 'Forbidden' }, 403);
+
+  await c.env.DB.prepare('DELETE FROM annotations WHERE id = ?').bind(id).run();
+  return c.json({ ok: true });
+});
+
 app.get('/', (c) => c.text('ereader API is running'));
 
 export default app;
