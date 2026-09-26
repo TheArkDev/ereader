@@ -15,19 +15,7 @@
       "database_id": "417ce42c-18e2-41bc-8cb9-444d00f9d3a7"
     }
   ],
-"observability": {
-    "logs": {
-      "enabled": true,
-      "head_sampling_rate": 1,
-      "invocation_logs": true,
-      "persist": true
-    },
-    "traces": {
-      "enabled": true,
-      "head_sampling_rate": 1,
-      "persist": true
-    }
-  },
+
 
 
 // Cloudflare R2 — actual book files (pdf/epub) + cover images.
@@ -55,4 +43,19 @@
   // whatever value is set in the dashboard back to whatever's here —
   // which is exactly what kept undoing the real API key.
   "vars": {}
+
+"observability": [
+    "logs": [
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true,
+      "persist": true
+    ],
+    "traces": [
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true
+    ]
+  ],
+
 }
