@@ -15,7 +15,9 @@
       "database_id": "417ce42c-18e2-41bc-8cb9-444d00f9d3a7"
     }
   ],
-
+"observability": [
+    "enabled": false
+  ],
 // Cloudflare R2 — actual book files (pdf/epub) + cover images.
   // Create with: wrangler r2 bucket create ereader-files
   "r2_buckets": [
