@@ -16,9 +16,6 @@
     }
   ],
 
-
-
-
 // Cloudflare R2 — actual book files (pdf/epub) + cover images.
   // Create with: wrangler r2 bucket create ereader-files
   "r2_buckets": [
@@ -43,7 +40,5 @@
   // If they're declared in this file's "vars", every deploy overwrites
   // whatever value is set in the dashboard back to whatever's here —
   // which is exactly what kept undoing the real API key.
-  "vars": {},
-
+  "vars": {}
 }
-
