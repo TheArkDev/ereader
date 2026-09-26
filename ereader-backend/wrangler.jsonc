@@ -16,7 +16,7 @@
     }
   ],
 
-  // Cloudflare R2 — actual book files (pdf/epub) + cover images.
+// Cloudflare R2 — actual book files (pdf/epub) + cover images.
   // Create with: wrangler r2 bucket create ereader-files
   "r2_buckets": [
     {
@@ -34,11 +34,13 @@
     }
   ],
 
-  "vars": {
-    // Override this in production with: wrangler secret put JWT_SECRET
-    "JWT_SECRET": "dev-only-change-me",
-    // Get a free API key at https://resend.com — override with:
-    // wrangler secret put RESEND_API_KEY
-    "RESEND_API_KEY": "dev-only-change-me"
-  }
+  // JWT_SECRET and RESEND_API_KEY are intentionally NOT declared here.
+  // They must be set as encrypted Secrets in the Cloudflare dashboard
+  // (Worker → Settings → Variables and Secrets → Add → Secret) instead.
+  // If they're declared in this file's "vars", every deploy overwrites
+  // whatever value is set in the dashboard back to whatever's here —
+  // which is exactly what kept undoing the real API key.
+  "vars": {}
+}
+
 }
