@@ -1,0 +1,44 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ereader-backend",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Cloudflare D1 — book + user metadata.
+  // Create with: wrangler d1 create ereader-db
+  // Then paste the returned database_id below.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ereader-db",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+    }
+  ],
+
+  // Cloudflare R2 — actual book files (pdf/epub) + cover images.
+  // Create with: wrangler r2 bucket create ereader-files
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "ereader-files"
+    }
+  ],
+
+  // Cloudflare KV — you already created this namespace ("ereader").
+  // Used here for logout / token revocation.
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "7284b235b7b14c239ae3ab6e5480c6c2"
+    }
+  ],
+
+  "vars": {
+    // Override this in production with: wrangler secret put JWT_SECRET
+    "JWT_SECRET": "dev-only-change-me",
+    // Get a free API key at https://resend.com — override with:
+    // wrangler secret put RESEND_API_KEY
+    "RESEND_API_KEY": "dev-only-change-me"
+  }
+}
