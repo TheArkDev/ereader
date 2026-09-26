@@ -16,14 +16,7 @@
     }
   ],
 
-  "observability": [
-{
-    "logs": {
-      "enabled": false,
-      "invocation_logs": true
-    }
-}
-  ],
+
 
 
 // Cloudflare R2 — actual book files (pdf/epub) + cover images.
