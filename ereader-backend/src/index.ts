@@ -126,38 +126,54 @@ app.get('/auth/me', requireAuth, async (c) => {
 // Reset tokens live in KV with a 1-hour TTL and are single-use.
 
 async function sendEmail(env: Env, to: string, subject: string, html: string): Promise<void> {
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${env.RESEND_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      // Resend's shared testing sender — works with no domain verification.
-      // Swap for your own verified domain's address once you have one.
-      from: 'ereader <onboarding@resend.dev>',
-      to,
-      subject,
-      html,
-    }),
-  });
-  if (!res.ok) {
-    console.error('Resend API error', res.status, await res.text());
+  console.log(`[sendEmail] calling Resend API, key present: ${env.RESEND_API_KEY ? 'yes (' + env.RESEND_API_KEY.slice(0, 5) + '...)' : 'NO — RESEND_API_KEY IS EMPTY'}`);
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        // Resend's shared testing sender — works with no domain verification.
+        // Swap for your own verified domain's address once you have one.
+        from: 'ereader <onboarding@resend.dev>',
+        to,
+        subject,
+        html,
+      }),
+    });
+    const responseText = await res.text();
+    if (!res.ok) {
+      console.error(`[sendEmail] Resend API error: status=${res.status} body=${responseText}`);
+    } else {
+      console.log(`[sendEmail] Resend accepted the request: status=${res.status} body=${responseText}`);
+    }
+  } catch (err) {
+    console.error(`[sendEmail] fetch() to Resend threw before getting any response: ${err}`);
   }
 }
 
 app.post('/auth/forgot-password', async (c) => {
   const body = await c.req.json<{ email?: string }>();
   const email = body.email?.trim().toLowerCase();
+  console.log(`[forgot-password] request for: ${email ?? '(empty)'}`);
 
   // Always respond the same way whether or not the email exists, so this
   // endpoint can't be used to discover which emails are registered.
   const genericResponse = c.json({ message: 'If that email is registered, a reset link has been sent.' });
-  if (!email) return genericResponse;
+  if (!email) {
+    console.log('[forgot-password] no email in request body — stopping here');
+    return genericResponse;
+  }
 
   const user = await c.env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first<{ id: string }>();
-  if (!user) return genericResponse;
+  if (!user) {
+    console.log(`[forgot-password] no user found for "${email}" — stopping here (this is the #1 suspect if no email ever arrives)`);
+    return genericResponse;
+  }
 
+  console.log(`[forgot-password] user found (id=${user.id}), generating token and emailing`);
   const token = crypto.randomUUID();
   await c.env.KV.put(`reset:${token}`, user.id, { expirationTtl: 3600 }); // 1 hour
 
