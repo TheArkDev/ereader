@@ -5,6 +5,17 @@
   "compatibility_date": "2024-11-01",
   "compatibility_flags": ["nodejs_compat"],
 
+// Turns on the Observability/Logs tab in the dashboard — needed to see
+  // console.log output from the Worker (was off by default, which is why
+  // no logs showed up for the /auth/forgot-password debugging).
+  "observability": {
+    "logs": {
+      "enabled": true
+    }
+  },
+
+
+
   // Cloudflare D1 — book + user metadata.
   // Create with: wrangler d1 create ereader-db
   // Then paste the returned database_id below.
