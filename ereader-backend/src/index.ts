@@ -135,9 +135,12 @@ async function sendEmail(env: Env, to: string, subject: string, html: string): P
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        // Resend's shared testing sender — works with no domain verification.
-        // Swap for your own verified domain's address once you have one.
-        from: 'ereader <onboarding@resend.dev>',
+        // Was 'ereader <onboarding@resend.dev>' (Resend's shared testing
+        // sender, which only delivers to your own Resend signup email —
+        // that's why early reset emails silently never arrived for other
+        // accounts). Now using the verified dominionlib.dpdns.org domain,
+        // which can send to any recipient.
+        from: 'ereader <noreply@dominionlib.dpdns.org>',
         to,
         subject,
         html,
@@ -506,6 +509,7 @@ app.delete('/admin/books/:id', requireAuth, requireAdmin, async (c) => {
 
   await c.env.DB.prepare('DELETE FROM reading_progress WHERE book_id = ?').bind(id).run();
   await c.env.DB.prepare('DELETE FROM annotations WHERE book_id = ?').bind(id).run();
+  await c.env.DB.prepare('DELETE FROM favorites WHERE book_id = ?').bind(id).run();
   await c.env.DB.prepare('DELETE FROM books WHERE id = ?').bind(id).run();
 
   return c.json({ ok: true });
@@ -570,6 +574,28 @@ app.put('/progress/:bookId', requireAuth, async (c) => {
      ON CONFLICT(user_id, book_id) DO UPDATE SET position = excluded.position, updated_at = datetime('now')`
   )
     .bind(c.get('userId'), c.req.param('bookId'), body.position)
+    .run();
+  return c.json({ ok: true });
+});
+
+// ---------- Favorites ----------
+app.get('/favorites', requireAuth, async (c) => {
+  const { results } = await c.env.DB.prepare('SELECT book_id FROM favorites WHERE user_id = ?')
+    .bind(c.get('userId'))
+    .all<{ book_id: string }>();
+  return c.json({ bookIds: results.map((r) => r.book_id) });
+});
+
+app.post('/favorites/:bookId', requireAuth, async (c) => {
+  await c.env.DB.prepare('INSERT OR IGNORE INTO favorites (user_id, book_id) VALUES (?, ?)')
+    .bind(c.get('userId'), c.req.param('bookId'))
+    .run();
+  return c.json({ ok: true });
+});
+
+app.delete('/favorites/:bookId', requireAuth, async (c) => {
+  await c.env.DB.prepare('DELETE FROM favorites WHERE user_id = ? AND book_id = ?')
+    .bind(c.get('userId'), c.req.param('bookId'))
     .run();
   return c.json({ ok: true });
 });
