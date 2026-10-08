@@ -30,6 +30,13 @@ async function requireAuth(c: any, next: any) {
   const payload = await verifyToken(token, c.env.JWT_SECRET);
   if (!payload) return c.json({ error: 'Invalid or expired token' }, 401);
 
+  // Checked on every request (not just at login) so disabling an account
+  // takes effect immediately, even for a token issued before the disable.
+  const user = await c.env.DB.prepare('SELECT is_disabled FROM users WHERE id = ?')
+    .bind(payload.userId)
+    .first<{ is_disabled: number }>();
+  if (!user || user.is_disabled === 1) return c.json({ error: 'Account disabled' }, 403);
+
   c.set('userId', payload.userId);
   c.set('email', payload.email);
   c.set('_token', token);
@@ -79,7 +86,7 @@ app.post('/auth/login', async (c) => {
   if (!email || !password) return c.json({ error: 'Email and password required' }, 400);
 
   const user = await c.env.DB.prepare(
-    'SELECT id, email, password_hash, password_salt, display_name, is_admin FROM users WHERE email = ?'
+    'SELECT id, email, password_hash, password_salt, display_name, is_admin, is_disabled FROM users WHERE email = ?'
   )
     .bind(email)
     .first<{
@@ -89,12 +96,15 @@ app.post('/auth/login', async (c) => {
       password_salt: string;
       display_name: string | null;
       is_admin: number;
+      is_disabled: number;
     }>();
 
   if (!user) return c.json({ error: 'Invalid credentials' }, 401);
 
   const ok = await verifyPassword(password, user.password_hash, user.password_salt);
   if (!ok) return c.json({ error: 'Invalid credentials' }, 401);
+
+  if (user.is_disabled === 1) return c.json({ error: 'This account has been disabled.' }, 403);
 
   const token = await signToken(user.id, user.email, c.env.JWT_SECRET);
   return c.json({
@@ -116,6 +126,36 @@ app.get('/auth/me', requireAuth, async (c) => {
     .first<{ id: string; email: string; display_name: string | null; is_admin: number }>();
   if (!user) return c.json({ error: 'Not found' }, 404);
   return c.json({ user: { ...user, is_admin: user.is_admin === 1 } });
+});
+
+app.patch('/auth/me', requireAuth, async (c) => {
+  const body = await c.req.json<{ displayName?: string }>();
+  const displayName = body.displayName?.trim();
+  await c.env.DB.prepare('UPDATE users SET display_name = COALESCE(?, display_name) WHERE id = ?')
+    .bind(displayName && displayName.length > 0 ? displayName : null, c.get('userId'))
+    .run();
+  return c.json({ ok: true });
+});
+
+app.post('/auth/change-password', requireAuth, async (c) => {
+  const body = await c.req.json<{ currentPassword?: string; newPassword?: string }>();
+  if (!body.currentPassword || !body.newPassword || body.newPassword.length < 8) {
+    return c.json({ error: 'currentPassword and a newPassword (min 8 chars) are required' }, 400);
+  }
+
+  const user = await c.env.DB.prepare('SELECT password_hash, password_salt FROM users WHERE id = ?')
+    .bind(c.get('userId'))
+    .first<{ password_hash: string; password_salt: string }>();
+  if (!user) return c.json({ error: 'Not found' }, 404);
+
+  const ok = await verifyPassword(body.currentPassword, user.password_hash, user.password_salt);
+  if (!ok) return c.json({ error: 'Current password is incorrect' }, 401);
+
+  const { hash, salt } = await hashPassword(body.newPassword);
+  await c.env.DB.prepare('UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?')
+    .bind(hash, salt, c.get('userId'))
+    .run();
+  return c.json({ ok: true });
 });
 
 // ---------- Password reset ----------
@@ -282,7 +322,28 @@ app.get('/books', requireAuth, async (c) => {
   sql += ' ORDER BY created_at DESC';
 
   const { results } = await c.env.DB.prepare(sql).bind(...params).all();
+
+  // Fire-and-forget search-hit tracking: only for real text searches (not
+  // plain browsing or a category-only filter), one UPDATE covering every
+  // matched book rather than one per row.
+  if (q && results.length > 0) {
+    const ids = results.map((r: any) => r.id as string);
+    const placeholders = ids.map(() => '?').join(',');
+    c.executionCtx.waitUntil(
+      c.env.DB.prepare(`UPDATE books SET search_hit_count = search_hit_count + 1 WHERE id IN (${placeholders})`)
+        .bind(...ids)
+        .run()
+    );
+  }
+
   return c.json({ books: results });
+});
+
+// Called by the app once when a book is opened in the reader. Best-effort —
+// the app doesn't wait on this or fail if it errors.
+app.post('/books/:id/view', requireAuth, async (c) => {
+  await c.env.DB.prepare('UPDATE books SET view_count = view_count + 1 WHERE id = ?').bind(c.req.param('id')).run();
+  return c.json({ ok: true });
 });
 
 // Distinct category list, for populating filter chips in the app.
@@ -547,6 +608,60 @@ app.post('/admin/books/backfill-covers', requireAuth, requireAdmin, async (c) =>
   }
 
   return c.json({ checked: results.length, updated, failed });
+});
+
+// ---------- Admin: book metrics ----------
+// Lightweight usage stats — no analytics infrastructure, just two counters
+// incremented in the routes above (view_count on open, search_hit_count on
+// matching a text search), surfaced here sorted so admins can see which
+// books get used and which don't.
+app.get('/admin/books/metrics', requireAuth, requireAdmin, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, title, author, cover_key, view_count, search_hit_count
+     FROM books ORDER BY view_count DESC, search_hit_count DESC`
+  ).all();
+  return c.json({ books: results });
+});
+
+// ---------- Admin: user management ----------
+app.get('/admin/users', requireAuth, requireAdmin, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    'SELECT id, email, display_name, is_admin, is_disabled, created_at FROM users ORDER BY created_at DESC'
+  ).all();
+  return c.json({ users: results });
+});
+
+app.post('/admin/users/:id/disable', requireAuth, requireAdmin, async (c) => {
+  const id = c.req.param('id');
+  if (id === c.get('userId')) return c.json({ error: "You can't disable your own account." }, 400);
+  await c.env.DB.prepare('UPDATE users SET is_disabled = 1 WHERE id = ?').bind(id).run();
+  return c.json({ ok: true });
+});
+
+app.post('/admin/users/:id/enable', requireAuth, requireAdmin, async (c) => {
+  await c.env.DB.prepare('UPDATE users SET is_disabled = 0 WHERE id = ?').bind(c.req.param('id')).run();
+  return c.json({ ok: true });
+});
+
+// ---------- Feedback ----------
+app.post('/feedback', requireAuth, async (c) => {
+  const body = await c.req.json<{ message?: string }>();
+  const message = body.message?.trim();
+  if (!message) return c.json({ error: 'message is required' }, 400);
+
+  await c.env.DB.prepare('INSERT INTO feedback (id, user_id, message) VALUES (?, ?, ?)')
+    .bind(crypto.randomUUID(), c.get('userId'), message)
+    .run();
+  return c.json({ ok: true });
+});
+
+app.get('/admin/feedback', requireAuth, requireAdmin, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT feedback.id, feedback.message, feedback.created_at, users.email AS user_email
+     FROM feedback JOIN users ON users.id = feedback.user_id
+     ORDER BY feedback.created_at DESC`
+  ).all();
+  return c.json({ feedback: results });
 });
 
 // ---------- Reading progress ----------
