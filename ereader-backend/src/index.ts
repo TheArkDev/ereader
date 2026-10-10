@@ -610,6 +610,58 @@ app.post('/admin/books/backfill-covers', requireAuth, requireAdmin, async (c) =>
   return c.json({ checked: results.length, updated, failed });
 });
 
+// ---------- Admin: bulk actions ----------
+// D1 allows roughly 100 bound parameters per statement, so each request is
+// capped at 90 ids; the app splits bigger selections into several requests.
+const MAX_BULK_IDS = 90;
+
+function parseBulkIds(body: any): string[] | null {
+  const ids = body?.ids;
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_BULK_IDS) return null;
+  if (!ids.every((i) => typeof i === 'string' && i.length > 0)) return null;
+  return ids as string[];
+}
+
+// Delete many books at once: DB rows first (children before parents, for the
+// foreign keys), then their R2 files, so a failure part-way can only leave
+// harmless orphaned files — never books whose files are gone.
+app.post('/admin/books/bulk-delete', requireAuth, requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const ids = parseBulkIds(body);
+  if (!ids) return c.json({ error: `ids must be 1–${MAX_BULK_IDS} book ids` }, 400);
+  const ph = ids.map(() => '?').join(',');
+
+  const { results } = await c.env.DB.prepare(`SELECT file_key, cover_key FROM books WHERE id IN (${ph})`)
+    .bind(...ids)
+    .all<{ file_key: string; cover_key: string | null }>();
+
+  await c.env.DB.prepare(`DELETE FROM reading_progress WHERE book_id IN (${ph})`).bind(...ids).run();
+  await c.env.DB.prepare(`DELETE FROM annotations WHERE book_id IN (${ph})`).bind(...ids).run();
+  await c.env.DB.prepare(`DELETE FROM favorites WHERE book_id IN (${ph})`).bind(...ids).run();
+  await c.env.DB.prepare(`DELETE FROM books WHERE id IN (${ph})`).bind(...ids).run();
+
+  const keys: string[] = [];
+  for (const r of results) {
+    keys.push(r.file_key);
+    if (r.cover_key) keys.push(r.cover_key);
+  }
+  if (keys.length > 0) await c.env.FILES.delete(keys);
+
+  return c.json({ deleted: results.length });
+});
+
+// Set the same category on many books at once.
+app.post('/admin/books/bulk-category', requireAuth, requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const ids = parseBulkIds(body);
+  const category = typeof body?.category === 'string' ? body.category.trim() : '';
+  if (!ids || !category) return c.json({ error: `category and 1–${MAX_BULK_IDS} ids are required` }, 400);
+  const ph = ids.map(() => '?').join(',');
+
+  await c.env.DB.prepare(`UPDATE books SET category = ? WHERE id IN (${ph})`).bind(category, ...ids).run();
+  return c.json({ updated: ids.length });
+});
+
 // ---------- Admin: book metrics ----------
 // Lightweight usage stats — no analytics infrastructure, just two counters
 // incremented in the routes above (view_count on open, search_hit_count on
