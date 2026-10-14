@@ -301,11 +301,28 @@ app.post('/reset-password', async (c) => {
 });
 
 // ---------- Book routes ----------
+// Book listing. Everything is optional, so old callers that send no
+// parameters still get the whole library exactly as before:
+//   q, category        – filters (search is title/author, case-insensitive)
+//   ids                – comma-separated book ids (max 80), for fetching specific books
+//   sort               – newest (default) | title | author | random
+//   coverFirst=1       – books without a cover first (admin tooling)
+//   limit, offset      – paging (limit capped at 90); response then includes `total`
+const MAX_PAGE = 90;
+const MAX_IDS_PARAM = 80;
+
 app.get('/books', requireAuth, async (c) => {
   const q = c.req.query('q')?.trim();
   const category = c.req.query('category')?.trim();
+  const sort = c.req.query('sort') ?? 'newest';
+  const coverFirst = c.req.query('coverFirst') === '1';
+  const idsParam = c.req.query('ids');
 
-  let sql = 'SELECT id, title, author, description, format, cover_key, category, created_at FROM books';
+  const limitNum = parseInt(c.req.query('limit') ?? '', 10);
+  const offsetNum = parseInt(c.req.query('offset') ?? '', 10);
+  const limit = Number.isFinite(limitNum) && limitNum > 0 ? Math.min(limitNum, MAX_PAGE) : null;
+  const offset = Number.isFinite(offsetNum) && offsetNum > 0 ? offsetNum : 0;
+
   const conditions: string[] = [];
   const params: unknown[] = [];
 
@@ -318,25 +335,86 @@ app.get('/books', requireAuth, async (c) => {
     conditions.push('category = ?');
     params.push(category);
   }
-  if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
-  sql += ' ORDER BY created_at DESC';
+  if (idsParam) {
+    const wanted = idsParam.split(',').map((i) => i.trim()).filter((i) => i.length > 0);
+    if (wanted.length === 0 || wanted.length > MAX_IDS_PARAM) {
+      return c.json({ error: `ids must contain 1–${MAX_IDS_PARAM} book ids` }, 400);
+    }
+    conditions.push(`id IN (${wanted.map(() => '?').join(',')})`);
+    params.push(...wanted);
+  }
+  const where = conditions.length ? ' WHERE ' + conditions.join(' AND ') : '';
 
-  const { results } = await c.env.DB.prepare(sql).bind(...params).all();
+  const orderParts: string[] = [];
+  if (coverFirst) orderParts.push('(cover_key IS NOT NULL) ASC'); // 0 = no cover, so those come first
+  switch (sort) {
+    case 'title':
+      orderParts.push('LOWER(title) ASC');
+      break;
+    case 'author':
+      orderParts.push("(author IS NULL OR author = '') ASC", 'LOWER(author) ASC'); // no author last
+      break;
+    case 'random':
+      orderParts.push('RANDOM()');
+      break;
+    default:
+      orderParts.push('created_at DESC');
+  }
+  orderParts.push('id ASC'); // stable tie-break so pages never overlap or skip
 
-  // Fire-and-forget search-hit tracking: only for real text searches (not
-  // plain browsing or a category-only filter), one UPDATE covering every
-  // matched book rather than one per row.
-  if (q && results.length > 0) {
-    const ids = results.map((r: any) => r.id as string);
-    const placeholders = ids.map(() => '?').join(',');
+  let sql = `SELECT id, title, author, description, format, cover_key, category, created_at FROM books${where} ORDER BY ${orderParts.join(', ')}`;
+  const pageParams = [...params];
+  if (limit !== null) {
+    sql += ' LIMIT ? OFFSET ?';
+    pageParams.push(limit, offset);
+  }
+
+  const { results } = await c.env.DB.prepare(sql).bind(...pageParams).all();
+
+  let total = results.length;
+  if (limit !== null) {
+    const countRow = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM books${where}`)
+      .bind(...params)
+      .first<{ n: number }>();
+    total = countRow?.n ?? results.length;
+  }
+
+  // Search-hit tracking: only for real text searches, only on the first page
+  // (so scrolling doesn't inflate counts), and capped to stay under D1's
+  // ~100 bound-parameter limit per statement.
+  if (q && offset === 0 && results.length > 0) {
+    const hitIds = results.slice(0, MAX_PAGE).map((r: any) => r.id as string);
+    const placeholders = hitIds.map(() => '?').join(',');
     c.executionCtx.waitUntil(
       c.env.DB.prepare(`UPDATE books SET search_hit_count = search_hit_count + 1 WHERE id IN (${placeholders})`)
-        .bind(...ids)
+        .bind(...hitIds)
         .run()
     );
   }
 
-  return c.json({ books: results });
+  return c.json({ books: results, total });
+});
+
+// The book of the day, picked server-side so the app never needs the whole
+// library just to choose one. `seed` is the caller's local date (YYYYMMDD),
+// so it changes at the reader's midnight rather than UTC's.
+app.get('/books/daily', requireAuth, async (c) => {
+  const countRow = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM books').first<{ n: number }>();
+  const total = countRow?.n ?? 0;
+  if (total === 0) return c.json({ book: null });
+
+  const seedNum = parseInt(c.req.query('seed') ?? '', 10);
+  const now = new Date();
+  const seed = Number.isFinite(seedNum) && seedNum > 0
+    ? seedNum
+    : now.getUTCFullYear() * 10000 + (now.getUTCMonth() + 1) * 100 + now.getUTCDate();
+
+  const book = await c.env.DB.prepare(
+    'SELECT id, title, author, description, format, cover_key, category, created_at FROM books ORDER BY id ASC LIMIT 1 OFFSET ?'
+  )
+    .bind(seed % total)
+    .first();
+  return c.json({ book: book ?? null });
 });
 
 // Called by the app once when a book is opened in the reader. Best-effort —
