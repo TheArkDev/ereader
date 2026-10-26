@@ -323,7 +323,7 @@ app.get('/books', requireAuth, async (c) => {
   const limit = Number.isFinite(limitNum) && limitNum > 0 ? Math.min(limitNum, MAX_PAGE) : null;
   const offset = Number.isFinite(offsetNum) && offsetNum > 0 ? offsetNum : 0;
 
-  const conditions: string[] = [];
+  const conditions: string[] = ['deleted_at IS NULL'];
   const params: unknown[] = [];
 
   if (q) {
@@ -399,7 +399,7 @@ app.get('/books', requireAuth, async (c) => {
 // library just to choose one. `seed` is the caller's local date (YYYYMMDD),
 // so it changes at the reader's midnight rather than UTC's.
 app.get('/books/daily', requireAuth, async (c) => {
-  const countRow = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM books').first<{ n: number }>();
+  const countRow = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL').first<{ n: number }>();
   const total = countRow?.n ?? 0;
   if (total === 0) return c.json({ book: null });
 
@@ -410,7 +410,7 @@ app.get('/books/daily', requireAuth, async (c) => {
     : now.getUTCFullYear() * 10000 + (now.getUTCMonth() + 1) * 100 + now.getUTCDate();
 
   const book = await c.env.DB.prepare(
-    'SELECT id, title, author, description, format, cover_key, category, created_at FROM books ORDER BY id ASC LIMIT 1 OFFSET ?'
+    'SELECT id, title, author, description, format, cover_key, category, created_at FROM books WHERE deleted_at IS NULL ORDER BY id ASC LIMIT 1 OFFSET ?'
   )
     .bind(seed % total)
     .first();
@@ -418,16 +418,24 @@ app.get('/books/daily', requireAuth, async (c) => {
 });
 
 // Called by the app once when a book is opened in the reader. Best-effort —
-// the app doesn't wait on this or fail if it errors.
+// the app doesn't wait on this or fail if it errors. Bumps the lifetime
+// counter AND logs a dated event, which is what makes "most read this week"
+// on the admin dashboard possible.
 app.post('/books/:id/view', requireAuth, async (c) => {
-  await c.env.DB.prepare('UPDATE books SET view_count = view_count + 1 WHERE id = ?').bind(c.req.param('id')).run();
+  const id = c.req.param('id');
+  const result = await c.env.DB.prepare('UPDATE books SET view_count = view_count + 1 WHERE id = ? AND deleted_at IS NULL')
+    .bind(id)
+    .run();
+  if ((result.meta?.changes ?? 0) > 0) {
+    await c.env.DB.prepare('INSERT INTO book_views (book_id, user_id) VALUES (?, ?)').bind(id, c.get('userId')).run();
+  }
   return c.json({ ok: true });
 });
 
 // Distinct category list, for populating filter chips in the app.
 app.get('/categories', requireAuth, async (c) => {
   const { results } = await c.env.DB.prepare(
-    "SELECT DISTINCT category FROM books WHERE category IS NOT NULL AND category != '' ORDER BY category"
+    "SELECT DISTINCT category FROM books WHERE category IS NOT NULL AND category != '' AND deleted_at IS NULL ORDER BY category"
   ).all();
   return c.json({ categories: results.map((r: any) => r.category as string) });
 });
@@ -435,7 +443,7 @@ app.get('/categories', requireAuth, async (c) => {
 app.get('/books/:id', requireAuth, async (c) => {
   const id = c.req.param('id');
   const book = await c.env.DB.prepare(
-    'SELECT id, title, author, description, format, cover_key, category, file_size, created_at FROM books WHERE id = ?'
+    'SELECT id, title, author, description, format, cover_key, category, file_size, created_at FROM books WHERE id = ? AND deleted_at IS NULL'
   )
     .bind(id)
     .first();
@@ -447,7 +455,7 @@ app.get('/books/:id', requireAuth, async (c) => {
 // so viewers can seek without downloading the whole file up front.
 app.get('/books/:id/file', requireAuth, async (c) => {
   const id = c.req.param('id');
-  const book = await c.env.DB.prepare('SELECT file_key, format FROM books WHERE id = ?')
+  const book = await c.env.DB.prepare('SELECT file_key, format FROM books WHERE id = ? AND deleted_at IS NULL')
     .bind(id)
     .first<{ file_key: string; format: string }>();
   if (!book) return c.json({ error: 'Not found' }, 404);
@@ -458,7 +466,7 @@ app.get('/books/:id/file', requireAuth, async (c) => {
 // Stream the cover image from R2.
 app.get('/books/:id/cover', requireAuth, async (c) => {
   const id = c.req.param('id');
-  const book = await c.env.DB.prepare('SELECT cover_key FROM books WHERE id = ?')
+  const book = await c.env.DB.prepare('SELECT cover_key FROM books WHERE id = ? AND deleted_at IS NULL')
     .bind(id)
     .first<{ cover_key: string | null }>();
   if (!book?.cover_key) return c.json({ error: 'No cover' }, 404);
@@ -583,7 +591,7 @@ app.patch('/admin/books/:id', requireAuth, requireAdmin, async (c) => {
   if (title) {
     const dupe = await c.env.DB.prepare(
       `SELECT id, title, author FROM books
-       WHERE id != ? AND LOWER(title) = LOWER(?) AND LOWER(COALESCE(author, '')) = LOWER(COALESCE(?, ''))`
+       WHERE id != ? AND deleted_at IS NULL AND LOWER(title) = LOWER(?) AND LOWER(COALESCE(author, '')) = LOWER(COALESCE(?, ''))`
     )
       .bind(id, title, author ?? '')
       .first<{ id: string; title: string; author: string | null }>();
@@ -635,22 +643,16 @@ app.patch('/admin/books/:id', requireAuth, requireAdmin, async (c) => {
   return c.json({ ok: true });
 });
 
-// Delete a book: removes the D1 row and its R2 objects (file + cover).
+// "Delete" now moves a book to the trash (hidden from readers, restorable for
+// 30 days). Files and reading data are kept until it's purged for good.
 app.delete('/admin/books/:id', requireAuth, requireAdmin, async (c) => {
   const id = c.req.param('id');
-  const book = await c.env.DB.prepare('SELECT file_key, cover_key FROM books WHERE id = ?')
+  const result = await c.env.DB.prepare(
+    "UPDATE books SET deleted_at = datetime('now') WHERE id = ? AND deleted_at IS NULL"
+  )
     .bind(id)
-    .first<{ file_key: string; cover_key: string | null }>();
-  if (!book) return c.json({ error: 'Not found' }, 404);
-
-  await c.env.FILES.delete(book.file_key);
-  if (book.cover_key) await c.env.FILES.delete(book.cover_key);
-
-  await c.env.DB.prepare('DELETE FROM reading_progress WHERE book_id = ?').bind(id).run();
-  await c.env.DB.prepare('DELETE FROM annotations WHERE book_id = ?').bind(id).run();
-  await c.env.DB.prepare('DELETE FROM favorites WHERE book_id = ?').bind(id).run();
-  await c.env.DB.prepare('DELETE FROM books WHERE id = ?').bind(id).run();
-
+    .run();
+  if ((result.meta?.changes ?? 0) === 0) return c.json({ error: 'Not found' }, 404);
   return c.json({ ok: true });
 });
 
@@ -661,7 +663,7 @@ app.delete('/admin/books/:id', requireAuth, requireAdmin, async (c) => {
 // left alone (not an error).
 app.post('/admin/books/backfill-covers', requireAuth, requireAdmin, async (c) => {
   const { results } = await c.env.DB.prepare(
-    `SELECT id, file_key FROM books WHERE format = 'epub' AND cover_key IS NULL`
+    `SELECT id, file_key FROM books WHERE format = 'epub' AND cover_key IS NULL AND deleted_at IS NULL`
   ).all<{ id: string; file_key: string }>();
 
   let updated = 0;
@@ -688,8 +690,8 @@ app.post('/admin/books/backfill-covers', requireAuth, requireAdmin, async (c) =>
   return c.json({ checked: results.length, updated, failed });
 });
 
-// ---------- Admin: bulk actions ----------
-// D1 allows roughly 100 bound parameters per statement, so each request is
+// ---------- Admin: shared helpers ----------
+// D1 allows roughly 100 bound parameters per statement, so bulk requests are
 // capped at 90 ids; the app splits bigger selections into several requests.
 const MAX_BULK_IDS = 90;
 
@@ -700,32 +702,96 @@ function parseBulkIds(body: any): string[] | null {
   return ids as string[];
 }
 
-// Delete many books at once: DB rows first (children before parents, for the
-// foreign keys), then their R2 files, so a failure part-way can only leave
-// harmless orphaned files — never books whose files are gone.
-app.post('/admin/books/bulk-delete', requireAuth, requireAdmin, async (c) => {
-  const body = await c.req.json().catch(() => null);
-  const ids = parseBulkIds(body);
-  if (!ids) return c.json({ error: `ids must be 1–${MAX_BULK_IDS} book ids` }, 400);
+function readPaging(c: any, defaultLimit = 60): { limit: number; offset: number } {
+  const limitNum = parseInt(c.req.query('limit') ?? '', 10);
+  const offsetNum = parseInt(c.req.query('offset') ?? '', 10);
+  return {
+    limit: Number.isFinite(limitNum) && limitNum > 0 ? Math.min(limitNum, MAX_BULK_IDS) : defaultLimit,
+    offset: Number.isFinite(offsetNum) && offsetNum > 0 ? offsetNum : 0,
+  };
+}
+
+// Permanently removes books. DB rows go first (children before parents, for
+// the foreign keys), then the R2 files — so a failure part-way can only leave
+// harmless orphaned files, never books whose files are gone.
+async function hardDeleteBooks(env: Env, ids: string[]): Promise<number> {
+  if (ids.length === 0) return 0;
   const ph = ids.map(() => '?').join(',');
 
-  const { results } = await c.env.DB.prepare(`SELECT file_key, cover_key FROM books WHERE id IN (${ph})`)
+  const { results } = await env.DB.prepare(`SELECT file_key, cover_key FROM books WHERE id IN (${ph})`)
     .bind(...ids)
     .all<{ file_key: string; cover_key: string | null }>();
 
-  await c.env.DB.prepare(`DELETE FROM reading_progress WHERE book_id IN (${ph})`).bind(...ids).run();
-  await c.env.DB.prepare(`DELETE FROM annotations WHERE book_id IN (${ph})`).bind(...ids).run();
-  await c.env.DB.prepare(`DELETE FROM favorites WHERE book_id IN (${ph})`).bind(...ids).run();
-  await c.env.DB.prepare(`DELETE FROM books WHERE id IN (${ph})`).bind(...ids).run();
+  await env.DB.prepare(`DELETE FROM reading_progress WHERE book_id IN (${ph})`).bind(...ids).run();
+  await env.DB.prepare(`DELETE FROM annotations WHERE book_id IN (${ph})`).bind(...ids).run();
+  await env.DB.prepare(`DELETE FROM favorites WHERE book_id IN (${ph})`).bind(...ids).run();
+  await env.DB.prepare(`DELETE FROM book_views WHERE book_id IN (${ph})`).bind(...ids).run();
+  await env.DB.prepare(`DELETE FROM books WHERE id IN (${ph})`).bind(...ids).run();
 
   const keys: string[] = [];
   for (const r of results) {
     keys.push(r.file_key);
     if (r.cover_key) keys.push(r.cover_key);
   }
-  if (keys.length > 0) await c.env.FILES.delete(keys);
+  if (keys.length > 0) await env.FILES.delete(keys);
+  return results.length;
+}
 
-  return c.json({ deleted: results.length });
+const BOOK_COLUMNS = 'id, title, author, description, format, cover_key, category, created_at';
+
+// A book "needs attention" if anything an admin would want filled in is empty.
+const NEEDS_ATTENTION_SQL =
+  "(cover_key IS NULL OR author IS NULL OR TRIM(author) = '' OR category IS NULL OR TRIM(category) = '' OR description IS NULL OR TRIM(description) = '')";
+
+// Groups of live books sharing the same title + author (ignoring case and
+// surrounding spaces) — the same rule the edit screen enforces.
+const DUPLICATE_GROUPS_SQL =
+  "SELECT LOWER(TRIM(title)) AS t, LOWER(TRIM(COALESCE(author, ''))) AS a, COUNT(*) AS c FROM books WHERE deleted_at IS NULL GROUP BY t, a HAVING c > 1";
+
+// ---------- Admin: trash, restore, bulk actions ----------
+
+// "Delete" moves books to the trash: hidden from every reader, files and
+// reading data kept, restorable for 30 days.
+app.post('/admin/books/bulk-delete', requireAuth, requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const ids = parseBulkIds(body);
+  if (!ids) return c.json({ error: `ids must be 1–${MAX_BULK_IDS} book ids` }, 400);
+  const ph = ids.map(() => '?').join(',');
+
+  const result = await c.env.DB.prepare(
+    `UPDATE books SET deleted_at = datetime('now') WHERE deleted_at IS NULL AND id IN (${ph})`
+  )
+    .bind(...ids)
+    .run();
+  return c.json({ deleted: result.meta?.changes ?? 0 });
+});
+
+app.post('/admin/books/restore', requireAuth, requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const ids = parseBulkIds(body);
+  if (!ids) return c.json({ error: `ids must be 1–${MAX_BULK_IDS} book ids` }, 400);
+  const ph = ids.map(() => '?').join(',');
+
+  const result = await c.env.DB.prepare(
+    `UPDATE books SET deleted_at = NULL WHERE deleted_at IS NOT NULL AND id IN (${ph})`
+  )
+    .bind(...ids)
+    .run();
+  return c.json({ restored: result.meta?.changes ?? 0 });
+});
+
+// Permanently deletes books — only ones already in the trash.
+app.post('/admin/books/purge', requireAuth, requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const ids = parseBulkIds(body);
+  if (!ids) return c.json({ error: `ids must be 1–${MAX_BULK_IDS} book ids` }, 400);
+  const ph = ids.map(() => '?').join(',');
+
+  const { results } = await c.env.DB.prepare(`SELECT id FROM books WHERE deleted_at IS NOT NULL AND id IN (${ph})`)
+    .bind(...ids)
+    .all<{ id: string }>();
+  const purged = await hardDeleteBooks(c.env, results.map((r) => r.id));
+  return c.json({ purged });
 });
 
 // Set the same category on many books at once.
@@ -736,21 +802,147 @@ app.post('/admin/books/bulk-category', requireAuth, requireAdmin, async (c) => {
   if (!ids || !category) return c.json({ error: `category and 1–${MAX_BULK_IDS} ids are required` }, 400);
   const ph = ids.map(() => '?').join(',');
 
-  await c.env.DB.prepare(`UPDATE books SET category = ? WHERE id IN (${ph})`).bind(category, ...ids).run();
+  await c.env.DB.prepare(`UPDATE books SET category = ? WHERE deleted_at IS NULL AND id IN (${ph})`)
+    .bind(category, ...ids)
+    .run();
   return c.json({ updated: ids.length });
 });
 
+// The trash. Anything in it for more than 30 days is permanently removed
+// first (done here, on demand, so no scheduled job is needed).
+app.get('/admin/trash', requireAuth, requireAdmin, async (c) => {
+  for (let i = 0; i < 5; i++) {
+    const { results } = await c.env.DB.prepare(
+      "SELECT id FROM books WHERE deleted_at IS NOT NULL AND deleted_at < datetime('now', '-30 days') LIMIT ?"
+    )
+      .bind(MAX_BULK_IDS)
+      .all<{ id: string }>();
+    if (results.length === 0) break;
+    await hardDeleteBooks(c.env, results.map((r) => r.id));
+  }
+
+  const { offset } = readPaging(c);
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, title, author, format, deleted_at, datetime(deleted_at, '+30 days') AS expires_at
+     FROM books WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC, id ASC LIMIT 100 OFFSET ?`
+  )
+    .bind(offset)
+    .all();
+  const countRow = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NOT NULL').first<{ n: number }>();
+  return c.json({ items: results, total: countRow?.n ?? results.length });
+});
+
+// Empties the trash a batch at a time; the app calls it until `remaining` is 0.
+app.post('/admin/trash/empty', requireAuth, requireAdmin, async (c) => {
+  const { results } = await c.env.DB.prepare('SELECT id FROM books WHERE deleted_at IS NOT NULL LIMIT ?')
+    .bind(MAX_BULK_IDS)
+    .all<{ id: string }>();
+  const purged = await hardDeleteBooks(c.env, results.map((r) => r.id));
+  const remainingRow = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NOT NULL').first<{ n: number }>();
+  return c.json({ purged, remaining: remainingRow?.n ?? 0 });
+});
+
+// ---------- Admin: the book list (server-side filter, search, paging) ----------
+//   filter  all | needs (missing cover/author/category/description) | duplicates
+//   q       title/author search     limit/offset   paging
+//   idsOnly=1  returns every matching id (for "select all N matching")
+app.get('/admin/books', requireAuth, requireAdmin, async (c) => {
+  const filter = c.req.query('filter') ?? 'all';
+  const q = c.req.query('q')?.trim().toLowerCase();
+  const idsOnly = c.req.query('idsOnly') === '1';
+  const { limit, offset } = readPaging(c);
+
+  const where: string[] = ['deleted_at IS NULL'];
+  const params: unknown[] = [];
+  if (q) {
+    where.push('(LOWER(title) LIKE ? OR LOWER(author) LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`);
+  }
+
+  let from = 'books b';
+  let extraSelect = '';
+  let order = '(cover_key IS NOT NULL) ASC, created_at DESC, id ASC'; // no cover first
+  if (filter === 'needs') {
+    where.push(NEEDS_ATTENTION_SQL);
+  } else if (filter === 'duplicates') {
+    from = `books b JOIN (${DUPLICATE_GROUPS_SQL}) d ON LOWER(TRIM(b.title)) = d.t AND LOWER(TRIM(COALESCE(b.author, ''))) = d.a`;
+    extraSelect = ', d.c AS dup_count';
+    // Copies of one book sit together; within a group the one with a cover
+    // (then the newest) comes first — that's the copy "select extras" keeps.
+    order = 'd.t ASC, d.a ASC, (cover_key IS NULL) ASC, created_at DESC, id ASC';
+  }
+  const whereSql = where.join(' AND ');
+
+  if (idsOnly) {
+    const { results } = await c.env.DB.prepare(`SELECT id FROM ${from} WHERE ${whereSql} ORDER BY ${order} LIMIT 20000`)
+      .bind(...params)
+      .all<{ id: string }>();
+    return c.json({ ids: results.map((r) => r.id) });
+  }
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT ${BOOK_COLUMNS}${extraSelect} FROM ${from} WHERE ${whereSql} ORDER BY ${order} LIMIT ? OFFSET ?`
+  )
+    .bind(...params, limit, offset)
+    .all();
+  const countRow = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM ${from} WHERE ${whereSql}`)
+    .bind(...params)
+    .first<{ n: number }>();
+  return c.json({ books: results, total: countRow?.n ?? results.length });
+});
+
+// Counts for the filter chips, in one round trip.
+app.get('/admin/books/summary', requireAuth, requireAdmin, async (c) => {
+  const res = await c.env.DB.batch([
+    c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL'),
+    c.env.DB.prepare(`SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL AND ${NEEDS_ATTENTION_SQL}`),
+    c.env.DB.prepare(`SELECT COALESCE(SUM(c), 0) AS n FROM (${DUPLICATE_GROUPS_SQL})`),
+    c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NOT NULL'),
+  ]);
+  const n = (i: number) => ((res[i].results?.[0] as any)?.n as number) ?? 0;
+  return c.json({ total: n(0), needsAttention: n(1), duplicates: n(2), trashed: n(3) });
+});
+
+// Every duplicate except one copy per group (the one with a cover, else the
+// newest) — what "Select extras" ticks.
+app.get('/admin/books/duplicate-extras', requireAuth, requireAdmin, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT id FROM (
+       SELECT id, ROW_NUMBER() OVER (
+         PARTITION BY LOWER(TRIM(title)), LOWER(TRIM(COALESCE(author, '')))
+         ORDER BY (cover_key IS NULL) ASC, created_at DESC, id ASC
+       ) AS rn
+       FROM books WHERE deleted_at IS NULL
+     ) WHERE rn > 1 LIMIT 20000`
+  ).all<{ id: string }>();
+  return c.json({ ids: results.map((r) => r.id) });
+});
+
 // ---------- Admin: book metrics ----------
-// Lightweight usage stats — no analytics infrastructure, just two counters
-// incremented in the routes above (view_count on open, search_hit_count on
-// matching a text search), surfaced here sorted so admins can see which
-// books get used and which don't.
+// Lightweight usage stats — two counters incremented in the routes above
+// (view_count on open, search_hit_count on matching a text search).
+// Top 100 only; "never used" books are listed separately below.
 app.get('/admin/books/metrics', requireAuth, requireAdmin, async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT id, title, author, cover_key, view_count, search_hit_count
-     FROM books ORDER BY view_count DESC, search_hit_count DESC`
+     FROM books WHERE deleted_at IS NULL AND (view_count > 0 OR search_hit_count > 0)
+     ORDER BY view_count DESC, search_hit_count DESC LIMIT 100`
   ).all();
   return c.json({ books: results });
+});
+
+// Books nobody has ever opened or found by searching — candidates to
+// promote or retire. Same fields as /books, so the app can open them for editing.
+app.get('/admin/books/inactive', requireAuth, requireAdmin, async (c) => {
+  const { limit, offset } = readPaging(c);
+  const cond = 'deleted_at IS NULL AND view_count = 0 AND search_hit_count = 0';
+  const { results } = await c.env.DB.prepare(
+    `SELECT ${BOOK_COLUMNS} FROM books WHERE ${cond} ORDER BY created_at DESC, id ASC LIMIT ? OFFSET ?`
+  )
+    .bind(limit, offset)
+    .all();
+  const countRow = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM books WHERE ${cond}`).first<{ n: number }>();
+  return c.json({ books: results, total: countRow?.n ?? results.length });
 });
 
 // ---------- Admin: user management ----------
@@ -773,6 +965,28 @@ app.post('/admin/users/:id/enable', requireAuth, requireAdmin, async (c) => {
   return c.json({ ok: true });
 });
 
+// Promote a reader to admin, or demote an admin. You can't change your own
+// role, which guarantees there is always at least one admin.
+app.post('/admin/users/:id/role', requireAuth, requireAdmin, async (c) => {
+  const id = c.req.param('id');
+  if (id === c.get('userId')) return c.json({ error: "You can't change your own role." }, 400);
+  const body = await c.req.json().catch(() => null);
+  if (typeof body?.isAdmin !== 'boolean') return c.json({ error: 'isAdmin (true/false) is required' }, 400);
+  await c.env.DB.prepare('UPDATE users SET is_admin = ? WHERE id = ?').bind(body.isAdmin ? 1 : 0, id).run();
+  return c.json({ ok: true });
+});
+
+// Permanently delete an account and everything personal to it.
+app.delete('/admin/users/:id', requireAuth, requireAdmin, async (c) => {
+  const id = c.req.param('id');
+  if (id === c.get('userId')) return c.json({ error: "You can't delete your own account." }, 400);
+  for (const table of ['reading_progress', 'annotations', 'favorites', 'feedback', 'book_views']) {
+    await c.env.DB.prepare(`DELETE FROM ${table} WHERE user_id = ?`).bind(id).run();
+  }
+  await c.env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id).run();
+  return c.json({ ok: true });
+});
+
 // ---------- Feedback ----------
 app.post('/feedback', requireAuth, async (c) => {
   const body = await c.req.json<{ message?: string }>();
@@ -785,13 +999,27 @@ app.post('/feedback', requireAuth, async (c) => {
   return c.json({ ok: true });
 });
 
+app.get('/admin/feedback/unread', requireAuth, requireAdmin, async (c) => {
+  const row = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM feedback WHERE status = 'new'").first<{ n: number }>();
+  return c.json({ count: row?.n ?? 0 });
+});
+
+// Unhandled first: new, then read, then done.
 app.get('/admin/feedback', requireAuth, requireAdmin, async (c) => {
   const { results } = await c.env.DB.prepare(
-    `SELECT feedback.id, feedback.message, feedback.created_at, users.email AS user_email
+    `SELECT feedback.id, feedback.message, feedback.created_at, feedback.status, users.email AS user_email
      FROM feedback JOIN users ON users.id = feedback.user_id
-     ORDER BY feedback.created_at DESC`
+     ORDER BY CASE feedback.status WHEN 'new' THEN 0 WHEN 'read' THEN 1 ELSE 2 END, feedback.created_at DESC`
   ).all();
   return c.json({ feedback: results });
+});
+
+app.patch('/admin/feedback/:id', requireAuth, requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const status = body?.status;
+  if (!['new', 'read', 'done'].includes(status)) return c.json({ error: "status must be 'new', 'read' or 'done'" }, 400);
+  await c.env.DB.prepare('UPDATE feedback SET status = ? WHERE id = ?').bind(status, c.req.param('id')).run();
+  return c.json({ ok: true });
 });
 
 // ---------- Reading progress ----------
@@ -929,6 +1157,157 @@ app.delete('/annotations/:id', requireAuth, async (c) => {
 
   await c.env.DB.prepare('DELETE FROM annotations WHERE id = ?').bind(id).run();
   return c.json({ ok: true });
+});
+
+// ---------- Admin: dashboard ----------
+// Everything is time-windowed to the last 7 days where it makes sense, which
+// the lifetime counters on each book can't do — that's what the dated
+// book_views log is for. Entries older than 90 days are pruned as we go.
+app.get('/admin/dashboard', requireAuth, requireAdmin, async (c) => {
+  c.executionCtx.waitUntil(
+    c.env.DB.prepare("DELETE FROM book_views WHERE viewed_at < datetime('now', '-90 days')").run()
+  );
+
+  const res = await c.env.DB.batch([
+    c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL'),
+    c.env.DB.prepare('SELECT COUNT(*) AS n FROM users'),
+    c.env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE created_at >= datetime('now', '-7 days')"),
+    c.env.DB.prepare("SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL AND created_at >= datetime('now', '-7 days')"),
+    c.env.DB.prepare(
+      "SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS readers FROM book_views WHERE viewed_at >= datetime('now', '-7 days')"
+    ),
+    c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NOT NULL'),
+    c.env.DB.prepare("SELECT COUNT(*) AS n FROM feedback WHERE status = 'new'"),
+    c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL AND cover_key IS NULL'),
+    c.env.DB.prepare(
+      `SELECT b.id, b.title, b.author, COUNT(*) AS views
+       FROM book_views v JOIN books b ON b.id = v.book_id
+       WHERE v.viewed_at >= datetime('now', '-7 days') AND b.deleted_at IS NULL
+       GROUP BY b.id ORDER BY views DESC, b.title ASC LIMIT 5`
+    ),
+  ]);
+  const n = (i: number, field = 'n') => ((res[i].results?.[0] as any)?.[field] as number) ?? 0;
+
+  return c.json({
+    totalBooks: n(0),
+    totalUsers: n(1),
+    newUsers7d: n(2),
+    newBooks7d: n(3),
+    opens7d: n(4),
+    activeReaders7d: n(4, 'readers'),
+    trashed: n(5),
+    feedbackUnread: n(6),
+    missingCovers: n(7),
+    topBooks7d: res[8].results ?? [],
+  });
+});
+
+// ---------- Admin: orphaned file cleanup ----------
+// Finds files in storage that no book points at any more (e.g. books deleted
+// straight from the database). Works one page of ~500 files per call; the
+// app loops until nextCursor is null, first as a dry run, then to delete.
+// Files uploaded in the last 10 minutes are never touched — an upload writes
+// the file before its database row, so a very recent file may simply be
+// mid-upload rather than orphaned.
+app.post('/admin/storage/orphans', requireAuth, requireAdmin, async (c) => {
+  const body: any = await c.req.json().catch(() => null);
+  const prefix = body?.prefix === 'covers/' ? 'covers/' : 'books/';
+  const cursor = typeof body?.cursor === 'string' && body.cursor.length > 0 ? body.cursor : undefined;
+  const doDelete = body?.delete === true;
+
+  const listing = await c.env.FILES.list({ prefix, cursor, limit: 500 });
+  const objects = listing.objects;
+
+  // File names are "<prefix><bookId>.<ext>", so look up the books they name
+  // and collect the exact keys those books still use.
+  const idOf = (key: string) => key.slice(prefix.length).split('.')[0];
+  const bookIds = [...new Set(objects.map((o) => idOf(o.key)))];
+  const inUse = new Set<string>();
+  for (let i = 0; i < bookIds.length; i += MAX_BULK_IDS) {
+    const chunk = bookIds.slice(i, i + MAX_BULK_IDS);
+    const ph = chunk.map(() => '?').join(',');
+    const { results } = await c.env.DB.prepare(`SELECT file_key, cover_key FROM books WHERE id IN (${ph})`)
+      .bind(...chunk)
+      .all<{ file_key: string; cover_key: string | null }>();
+    for (const r of results) {
+      inUse.add(r.file_key);
+      if (r.cover_key) inUse.add(r.cover_key);
+    }
+  }
+
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  const orphans = objects.filter((o) => !inUse.has(o.key) && o.uploaded.getTime() < cutoff);
+  const orphanBytes = orphans.reduce((sum, o) => sum + o.size, 0);
+  if (doDelete && orphans.length > 0) await c.env.FILES.delete(orphans.map((o) => o.key));
+
+  return c.json({
+    prefix,
+    scanned: objects.length,
+    orphans: orphans.length,
+    orphanBytes,
+    deleted: doDelete ? orphans.length : 0,
+    nextCursor: listing.truncated ? listing.cursor : null,
+  });
+});
+
+// ---------- Announcement banner ----------
+// One optional message shown at the top of Home. Publishing gives it a fresh
+// id, so people who dismissed an older announcement see the new one.
+app.get('/announcement', requireAuth, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    "SELECT key, value FROM settings WHERE key IN ('announcement_text', 'announcement_id')"
+  ).all<{ key: string; value: string }>();
+  const map = new Map(results.map((r) => [r.key, r.value]));
+  const text = map.get('announcement_text');
+  if (!text) return c.json({ announcement: null });
+  return c.json({ announcement: { id: map.get('announcement_id') ?? '0', text } });
+});
+
+app.put('/admin/announcement', requireAuth, requireAdmin, async (c) => {
+  const body: any = await c.req.json().catch(() => null);
+  const text = typeof body?.text === 'string' ? body.text.trim().slice(0, 300) : '';
+
+  if (!text) {
+    await c.env.DB.prepare("DELETE FROM settings WHERE key IN ('announcement_text', 'announcement_id')").run();
+    return c.json({ ok: true, announcement: null });
+  }
+  const id = crypto.randomUUID();
+  const upsert = 'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value';
+  await c.env.DB.batch([
+    c.env.DB.prepare(upsert).bind('announcement_text', text),
+    c.env.DB.prepare(upsert).bind('announcement_id', id),
+  ]);
+  return c.json({ ok: true, announcement: { id, text } });
+});
+
+// ---------- Admin: export ----------
+// The whole library as a CSV (a UTF-8 byte-order mark first, so Excel shows
+// accented characters correctly) — a backup of the catalogue, not the files.
+app.get('/admin/export/books.csv', requireAuth, requireAdmin, async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, title, author, category, format, description, file_size,
+            CASE WHEN cover_key IS NULL THEN 0 ELSE 1 END AS has_cover,
+            view_count, search_hit_count, created_at
+     FROM books WHERE deleted_at IS NULL ORDER BY created_at DESC, id ASC`
+  ).all();
+
+  const columns = [
+    'id', 'title', 'author', 'category', 'format', 'description',
+    'file_size', 'has_cover', 'view_count', 'search_hit_count', 'created_at',
+  ];
+  const cell = (value: unknown) => {
+    const text = value === null || value === undefined ? '' : String(value);
+    return /[",\r\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+  };
+  const lines = [columns.join(',')];
+  for (const row of results as any[]) lines.push(columns.map((k) => cell(row[k])).join(','));
+
+  return new Response('\uFEFF' + lines.join('\r\n'), {
+    headers: {
+      'content-type': 'text/csv; charset=utf-8',
+      'content-disposition': 'attachment; filename="ereader-books.csv"',
+    },
+  });
 });
 
 app.get('/', (c) => c.text('ereader API is running'));
