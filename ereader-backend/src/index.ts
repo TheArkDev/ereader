@@ -656,6 +656,32 @@ app.delete('/admin/books/:id', requireAuth, requireAdmin, async (c) => {
   return c.json({ ok: true });
 });
 
+// Sets (or replaces) only a book's cover image — the request body is the raw
+// image. The app uses this to attach a cover it rendered from a PDF's first
+// page. Deliberately separate from the edit endpoint, which rewrites the
+// author, description and category along with it.
+app.put('/admin/books/:id/cover', requireAuth, requireAdmin, async (c) => {
+  const id = c.req.param('id');
+  const book = await c.env.DB.prepare('SELECT cover_key FROM books WHERE id = ? AND deleted_at IS NULL')
+    .bind(id)
+    .first<{ cover_key: string | null }>();
+  if (!book) return c.json({ error: 'Not found' }, 404);
+
+  const bytes = await c.req.arrayBuffer();
+  if (bytes.byteLength === 0) return c.json({ error: 'The image is empty' }, 400);
+  if (bytes.byteLength > 5 * 1024 * 1024) return c.json({ error: 'The image is larger than 5 MB' }, 413);
+
+  const sent = c.req.header('content-type') ?? '';
+  const contentType = sent.startsWith('image/') ? sent : 'image/png';
+  const key = book.cover_key ?? `covers/${id}.${contentType === 'image/png' ? 'png' : 'jpg'}`;
+
+  await c.env.FILES.put(key, bytes, { httpMetadata: { contentType } });
+  if (!book.cover_key) {
+    await c.env.DB.prepare('UPDATE books SET cover_key = ? WHERE id = ?').bind(key, id).run();
+  }
+  return c.json({ ok: true, cover_key: key });
+});
+
 // One-off maintenance action: for EPUBs already uploaded before cover
 // auto-extraction existed, try pulling their embedded cover now. Safe to
 // call repeatedly — only touches books with format='epub' and cover_key
@@ -864,6 +890,8 @@ app.get('/admin/books', requireAuth, requireAdmin, async (c) => {
   let order = '(cover_key IS NOT NULL) ASC, created_at DESC, id ASC'; // no cover first
   if (filter === 'needs') {
     where.push(NEEDS_ATTENTION_SQL);
+  } else if (filter === 'pdfcover') {
+    where.push("format = 'pdf' AND cover_key IS NULL");
   } else if (filter === 'duplicates') {
     from = `books b JOIN (${DUPLICATE_GROUPS_SQL}) d ON LOWER(TRIM(b.title)) = d.t AND LOWER(TRIM(COALESCE(b.author, ''))) = d.a`;
     extraSelect = ', d.c AS dup_count';
@@ -898,9 +926,10 @@ app.get('/admin/books/summary', requireAuth, requireAdmin, async (c) => {
     c.env.DB.prepare(`SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL AND ${NEEDS_ATTENTION_SQL}`),
     c.env.DB.prepare(`SELECT COALESCE(SUM(c), 0) AS n FROM (${DUPLICATE_GROUPS_SQL})`),
     c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NOT NULL'),
+    c.env.DB.prepare("SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL AND format = 'pdf' AND cover_key IS NULL"),
   ]);
   const n = (i: number) => ((res[i].results?.[0] as any)?.n as number) ?? 0;
-  return c.json({ total: n(0), needsAttention: n(1), duplicates: n(2), trashed: n(3) });
+  return c.json({ total: n(0), needsAttention: n(1), duplicates: n(2), trashed: n(3), pdfsWithoutCover: n(4) });
 });
 
 // Every duplicate except one copy per group (the one with a cover, else the
