@@ -308,6 +308,11 @@ app.post('/reset-password', async (c) => {
 //   sort               – newest (default) | title | author | random
 //   coverFirst=1       – books without a cover first (admin tooling)
 //   limit, offset      – paging (limit capped at 90); response then includes `total`
+// Admin ordering: no cover first, then books that have a cover but no author or
+// description, then everything else.
+const ATTENTION_ORDER_SQL =
+  "CASE WHEN cover_key IS NULL THEN 0 WHEN author IS NULL OR TRIM(author) = '' OR description IS NULL OR TRIM(description) = '' THEN 1 ELSE 2 END ASC";
+
 const MAX_PAGE = 90;
 const MAX_IDS_PARAM = 80;
 
@@ -346,7 +351,7 @@ app.get('/books', requireAuth, async (c) => {
   const where = conditions.length ? ' WHERE ' + conditions.join(' AND ') : '';
 
   const orderParts: string[] = [];
-  if (coverFirst) orderParts.push('(cover_key IS NOT NULL) ASC'); // 0 = no cover, so those come first
+ if (coverFirst) orderParts.push(ATTENTION_ORDER_SQL); // 0 = no cover, so those come first
   switch (sort) {
     case 'title':
       orderParts.push('LOWER(title) ASC');
@@ -887,11 +892,15 @@ app.get('/admin/books', requireAuth, requireAdmin, async (c) => {
 
   let from = 'books b';
   let extraSelect = '';
-  let order = '(cover_key IS NOT NULL) ASC, created_at DESC, id ASC'; // no cover first
+  let order = ATTENTION_ORDER_SQL + ', created_at DESC, id ASC';// no cover first
   if (filter === 'needs') {
     where.push(NEEDS_ATTENTION_SQL);
-  } else if (filter === 'pdfcover') {
+    } else if (filter === 'pdfcover') {
     where.push("format = 'pdf' AND cover_key IS NULL");
+  } else if (filter === 'uncategorized') {
+    where.push("(category IS NULL OR TRIM(category) = '')");
+  } else if (filter === 'categorized') {
+    where.push("(category IS NOT NULL AND TRIM(category) != '')");
   } else if (filter === 'duplicates') {
     from = `books b JOIN (${DUPLICATE_GROUPS_SQL}) d ON LOWER(TRIM(b.title)) = d.t AND LOWER(TRIM(COALESCE(b.author, ''))) = d.a`;
     extraSelect = ', d.c AS dup_count';
