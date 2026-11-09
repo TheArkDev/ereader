@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { hashPassword, verifyPassword, signToken, verifyToken } from './auth';
 import { extractEpubCover } from './epubCover';
+import { readEpubMetadata, readPdfMetadata, titleRelation, confidenceFor } from './bookMetadata';
 
 export interface Env {
   DB: D1Database;
@@ -310,8 +311,12 @@ app.post('/reset-password', async (c) => {
 //   limit, offset      – paging (limit capped at 90); response then includes `total`
 // Admin ordering: no cover first, then books that have a cover but no author or
 // description, then everything else.
-const ATTENTION_ORDER_SQL =
-  "CASE WHEN cover_key IS NULL THEN 0 WHEN author IS NULL OR TRIM(author) = '' OR description IS NULL OR TRIM(description) = '' THEN 1 ELSE 2 END ASC";
+// A value counts as "empty" if it's truly blank OR a placeholder someone typed in.
+const BLANK_VALUES_SQL = "('na', 'n/a', 'n.a.', 'none', 'null', 'nil', '-', '--', 'unknown', 'not available', 'tbd')";
+const isBlankSql = (column: string) =>
+  `(${column} IS NULL OR TRIM(${column}) = '' OR LOWER(TRIM(${column})) IN ${BLANK_VALUES_SQL})`;
+
+const ATTENTION_ORDER_SQL = `CASE WHEN cover_key IS NULL THEN 0 WHEN ${isBlankSql('author')} OR ${isBlankSql('description')} THEN 1 ELSE 2 END ASC`;
 
 const MAX_PAGE = 90;
 const MAX_IDS_PARAM = 80;
@@ -771,9 +776,7 @@ async function hardDeleteBooks(env: Env, ids: string[]): Promise<number> {
 const BOOK_COLUMNS = 'id, title, author, description, format, cover_key, category, created_at';
 
 // A book "needs attention" if anything an admin would want filled in is empty.
-const NEEDS_ATTENTION_SQL =
-  "(cover_key IS NULL OR author IS NULL OR TRIM(author) = '' OR category IS NULL OR TRIM(category) = '' OR description IS NULL OR TRIM(description) = '')";
-
+const NEEDS_ATTENTION_SQL = `(cover_key IS NULL OR ${isBlankSql('author')} OR ${isBlankSql('category')} OR ${isBlankSql('description')})`;
 // Groups of live books sharing the same title + author (ignoring case and
 // surrounding spaces) — the same rule the edit screen enforces.
 const DUPLICATE_GROUPS_SQL =
@@ -897,10 +900,12 @@ app.get('/admin/books', requireAuth, requireAdmin, async (c) => {
     where.push(NEEDS_ATTENTION_SQL);
     } else if (filter === 'pdfcover') {
     where.push("format = 'pdf' AND cover_key IS NULL");
-  } else if (filter === 'uncategorized') {
-    where.push("(category IS NULL OR TRIM(category) = '')");
+    } else if (filter === 'uncategorized') {
+    where.push(isBlankSql('category'));
   } else if (filter === 'categorized') {
-    where.push("(category IS NOT NULL AND TRIM(category) != '')");
+    where.push(`NOT ${isBlankSql('category')}`);
+  } else if (filter === 'needsdetails') {
+    where.push(`(${isBlankSql('author')} OR ${isBlankSql('description')})`);
   } else if (filter === 'duplicates') {
     from = `books b JOIN (${DUPLICATE_GROUPS_SQL}) d ON LOWER(TRIM(b.title)) = d.t AND LOWER(TRIM(COALESCE(b.author, ''))) = d.a`;
     extraSelect = ', d.c AS dup_count';
@@ -954,6 +959,109 @@ app.get('/admin/books/duplicate-extras', requireAuth, requireAdmin, async (c) =>
      ) WHERE rn > 1 LIMIT 20000`
   ).all<{ id: string }>();
   return c.json({ ids: results.map((r) => r.id) });
+});
+
+// ---------- Admin: book metrics ----------
+
+
+
+
+// ---------- Admin: read author/description from inside the book files ----------
+// For up to 5 books at a time, opens the actual PDF/EPUB in storage and reports
+// what's written inside it. Read-only: nothing is saved here — the app shows
+// the findings for review, then saves the ones you approve via /bulk-details.
+app.post('/admin/books/read-metadata', requireAuth, requireAdmin, async (c) => {
+  const body: any = await c.req.json().catch(() => null);
+  const ids = body?.ids;
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > 5 || !ids.every((i: unknown) => typeof i === 'string' && i.length > 0)) {
+    return c.json({ error: 'ids must be 1–5 book ids' }, 400);
+  }
+  const ph = ids.map(() => '?').join(',');
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, title, format, file_key FROM books WHERE deleted_at IS NULL AND id IN (${ph})`
+  )
+    .bind(...ids)
+    .all<{ id: string; title: string; format: string; file_key: string }>();
+
+  const CHUNK = 128 * 1024; // a PDF's details sit near its start or end, so read just those
+  const out: Array<Record<string, unknown>> = [];
+  for (const book of results) {
+    try {
+      const isEpub = book.format === 'epub';
+      let meta: ReturnType<typeof readEpubMetadata>;
+
+      if (isEpub) {
+        const object = await c.env.FILES.get(book.file_key);
+        if (!object) {
+          out.push({ id: book.id, error: 'The file is missing from storage' });
+          continue;
+        }
+        meta = readEpubMetadata(new Uint8Array(await object.arrayBuffer()));
+      } else {
+        const head = await c.env.FILES.get(book.file_key, { range: { offset: 0, length: CHUNK } });
+        if (!head) {
+          out.push({ id: book.id, error: 'The file is missing from storage' });
+          continue;
+        }
+        let tailBytes: Uint8Array | undefined;
+        try {
+          const tail = await c.env.FILES.get(book.file_key, { range: { suffix: CHUNK } });
+          if (tail) tailBytes = new Uint8Array(await tail.arrayBuffer());
+        } catch {
+          // The start of the file alone is still worth reading.
+        }
+        meta = readPdfMetadata(new Uint8Array(await head.arrayBuffer()), tailBytes);
+      }
+
+      out.push({
+        id: book.id,
+        author: meta.author ?? null,
+        description: meta.description ?? null,
+        confidence: confidenceFor(isEpub ? 'epub' : 'pdf', titleRelation(book.title, meta.title)),
+        source: isEpub ? 'EPUB' : 'PDF',
+      });
+    } catch (err) {
+      out.push({ id: book.id, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  return c.json({ results: out });
+});
+
+// Fills in author and/or description for many books at once. Only ever fills a
+// field that is still empty (or a placeholder like "NA") — it never overwrites
+// text someone has written, even if the book was edited while the app was working.
+app.post('/admin/books/bulk-details', requireAuth, requireAdmin, async (c) => {
+  const body: any = await c.req.json().catch(() => null);
+  const updates = body?.updates;
+  if (!Array.isArray(updates) || updates.length === 0 || updates.length > 40) {
+    return c.json({ error: 'updates must contain 1–40 items' }, 400);
+  }
+
+  const clean = (value: unknown, max: number): string | null => {
+    if (typeof value !== 'string') return null;
+    const text = value.trim().slice(0, max);
+    return text.length > 0 ? text : null;
+  };
+
+  const statements: D1PreparedStatement[] = [];
+  for (const u of updates) {
+    if (typeof u?.id !== 'string' || u.id.length === 0) continue;
+    const author = clean(u.author, 200);
+    const description = clean(u.description, 2000);
+    if (author === null && description === null) continue;
+    statements.push(
+      c.env.DB.prepare(
+        `UPDATE books SET
+           author = CASE WHEN ? IS NOT NULL AND ${isBlankSql('author')} THEN ? ELSE author END,
+           description = CASE WHEN ? IS NOT NULL AND ${isBlankSql('description')} THEN ? ELSE description END
+         WHERE id = ? AND deleted_at IS NULL`
+      ).bind(author, author, description, description, u.id)
+    );
+  }
+  if (statements.length === 0) return c.json({ updated: 0 });
+
+  const results = await c.env.DB.batch(statements);
+  return c.json({ updated: results.reduce((sum, r) => sum + (r.meta?.changes ?? 0), 0) });
 });
 
 // ---------- Admin: book metrics ----------
