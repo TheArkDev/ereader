@@ -1,4 +1,4 @@
-import { strFromU8, unzipSync } from 'fflate';
+import { inflateSync, strFromU8, unzipSync } from 'fflate';
 
 // Reads a book's author, description and title from inside the file itself.
 //
@@ -147,25 +147,8 @@ function firstTag(xml: string, name: string): string | undefined {
   return m?.[1];
 }
 
-export function readEpubMetadata(bytes: Uint8Array): FileMetadata {
-  // Only inflate the two tiny files we need, not the whole book.
-  const files = unzipSync(bytes, {
-    filter: (file) => file.name === 'META-INF/container.xml' || file.name.toLowerCase().endsWith('.opf'),
-  });
-
-  let opfBytes: Uint8Array | undefined;
-  const container = files['META-INF/container.xml'];
-  if (container) {
-    const path = /full-path\s*=\s*["']([^"']+)["']/i.exec(strFromU8(container))?.[1];
-    if (path) opfBytes = files[path] ?? files[decodeURIComponent(path)];
-  }
-  if (!opfBytes) {
-    const anyOpf = Object.keys(files).find((name) => name.toLowerCase().endsWith('.opf'));
-    if (anyOpf) opfBytes = files[anyOpf];
-  }
-  if (!opfBytes) return {};
-
-  const xml = strFromU8(opfBytes);
+/** Author / description / title from the text of an EPUB's package (.opf) file. */
+export function parseEpubPackage(xml: string): FileMetadata {
   const metadata = /<(?:\w+:)?metadata\b[\s\S]*?<\/(?:\w+:)?metadata>/i.exec(xml)?.[0] ?? xml;
 
   // EPUB 3 can label each creator's role (author, translator, illustrator…) in
@@ -185,14 +168,166 @@ export function readEpubMetadata(bytes: Uint8Array): FileMetadata {
     if (name && !authors.includes(name)) authors.push(name);
   }
 
-  const title = firstTag(metadata, 'title');
+  const rawTitle = firstTag(metadata, 'title');
+  const title = rawTitle ? cleanTitle(rawTitle) : undefined;
   const result: FileMetadata = {};
   if (authors.length > 0) result.author = authors.slice(0, 3).join(', ');
-  const description = cleanDescription(firstTag(metadata, 'description'), title ? htmlToText(title) : undefined);
+  const description = cleanDescription(firstTag(metadata, 'description'), title);
   if (description) result.description = description;
-  const cleanedTitle = cleanTitle(title);
-  if (cleanedTitle) result.title = cleanedTitle;
+  if (title) result.title = title;
   return result;
+}
+
+function opfPathFromContainer(containerXml: string): string | undefined {
+  return /full-path\s*=\s*["']([^"']+)["']/i.exec(containerXml)?.[1];
+}
+
+/** Reads an EPUB that's already fully in memory. Fine for small files and tests;
+ *  the Worker uses {@link readEpubMetadataRanged} so big books never get loaded. */
+export function readEpubMetadata(bytes: Uint8Array): FileMetadata {
+  // Only inflate the two tiny files we need, not the whole book.
+  const files = unzipSync(bytes, {
+    filter: (file) => file.name === 'META-INF/container.xml' || file.name.toLowerCase().endsWith('.opf'),
+  });
+
+  let opfBytes: Uint8Array | undefined;
+  const container = files['META-INF/container.xml'];
+  if (container) {
+    const path = opfPathFromContainer(strFromU8(container));
+    if (path) opfBytes = files[path] ?? files[decodeURIComponent(path)];
+  }
+  if (!opfBytes) {
+    const anyOpf = Object.keys(files).find((name) => name.toLowerCase().endsWith('.opf'));
+    if (anyOpf) opfBytes = files[anyOpf];
+  }
+  return opfBytes ? parseEpubPackage(strFromU8(opfBytes)) : {};
+}
+
+// ----- reading an EPUB without loading it -----
+//
+// A zip file keeps an index (the "central directory") at its very end. So to
+// find the two small files we want we read the last 256 KB of the book, locate
+// them in the index, and fetch just those bytes — a few hundred KB however big
+// the EPUB is. Loading a 40 MB EPUB whole is what pushes a Worker over its
+// CPU/memory limit and makes Cloudflare answer "503".
+
+export interface RangedSource {
+  /** Total size of the file in bytes. */
+  size: number;
+  /** The bytes from `offset` for `length` (fewer if the file ends first). */
+  read(offset: number, length: number): Promise<Uint8Array>;
+}
+
+interface ZipEntry {
+  name: string;
+  nameLength: number;
+  method: number;
+  compressedSize: number;
+  uncompressedSize: number;
+  localOffset: number;
+}
+
+const MAX_METADATA_FILE = 3 * 1024 * 1024; // an .opf is a few KB; refuse anything absurd
+const MAX_ZIP_INDEX = 8 * 1024 * 1024;
+const TAIL_BYTES = 256 * 1024;
+
+async function readZipEntry(source: RangedSource, entry: ZipEntry): Promise<Uint8Array> {
+  if (entry.compressedSize > MAX_METADATA_FILE || entry.uncompressedSize > MAX_METADATA_FILE) {
+    throw new Error(`${entry.name} is unexpectedly large`);
+  }
+  // One read normally covers the entry's local header and its data. The local
+  // header's own name/extra lengths can differ a little from the index's, hence the slack.
+  const chunk = await source.read(entry.localOffset, 30 + entry.nameLength + 1024 + entry.compressedSize);
+  if (chunk.length < 30) throw new Error('Corrupt zip entry');
+  const view = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  if (view.getUint32(0, true) !== 0x04034b50) throw new Error('Corrupt zip entry header');
+
+  const dataStart = 30 + view.getUint16(26, true) + view.getUint16(28, true);
+  const data =
+    dataStart + entry.compressedSize <= chunk.length
+      ? chunk.subarray(dataStart, dataStart + entry.compressedSize)
+      : await source.read(entry.localOffset + dataStart, entry.compressedSize);
+  if (data.length < entry.compressedSize) throw new Error('Truncated zip entry');
+
+  if (entry.method === 0) return data; // stored
+  if (entry.method === 8) return inflateSync(data); // deflated
+  throw new Error(`Unsupported zip compression (${entry.method})`);
+}
+
+export async function readEpubMetadataRanged(source: RangedSource): Promise<FileMetadata> {
+  if (source.size < 22) throw new Error('Not a valid EPUB (too small)');
+
+  const tailLength = Math.min(source.size, TAIL_BYTES);
+  const tailStart = source.size - tailLength;
+  const tail = await source.read(tailStart, tailLength);
+
+  // The "end of central directory" record: signature PK\x05\x06, within the last 64 KB + 22.
+  let eocd = -1;
+  for (let i = tail.length - 22; i >= 0 && i >= tail.length - 22 - 65535; i--) {
+    if (tail[i] === 0x50 && tail[i + 1] === 0x4b && tail[i + 2] === 0x05 && tail[i + 3] === 0x06) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) throw new Error('Not a valid EPUB (no zip index)');
+
+  const tv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
+  const entryCount = tv.getUint16(eocd + 10, true);
+  const indexSize = tv.getUint32(eocd + 12, true);
+  const indexOffset = tv.getUint32(eocd + 16, true);
+  if (entryCount === 0xffff || indexSize === 0xffffffff || indexOffset === 0xffffffff) {
+    throw new Error('ZIP64 archives are not supported');
+  }
+  if (indexSize > MAX_ZIP_INDEX || indexOffset + indexSize > source.size) throw new Error('Corrupt zip index');
+
+  const index =
+    indexOffset >= tailStart
+      ? tail.subarray(indexOffset - tailStart, indexOffset - tailStart + indexSize)
+      : await source.read(indexOffset, indexSize);
+
+  // Walk the index, keeping only the entries we care about.
+  const wanted = new Map<string, ZipEntry>();
+  const iv = new DataView(index.buffer, index.byteOffset, index.byteLength);
+  let p = 0;
+  while (p + 46 <= index.length && iv.getUint32(p, true) === 0x02014b50) {
+    const nameLength = iv.getUint16(p + 28, true);
+    const extraLength = iv.getUint16(p + 30, true);
+    const commentLength = iv.getUint16(p + 32, true);
+    const nameStart = p + 46;
+    const nameEnd = nameStart + nameLength;
+    // An EPUB can hold thousands of entries; test the raw bytes and only turn
+    // the two we want into strings (cheap — this runs inside a CPU-limited Worker).
+    const isContainer = nameLength === 22 && strFromU8(index.subarray(nameStart, nameEnd)) === 'META-INF/container.xml';
+    const isOpf =
+      nameLength > 4 &&
+      index[nameEnd - 4] === 0x2e && // "."
+      (index[nameEnd - 3] | 0x20) === 0x6f && // o / O
+      (index[nameEnd - 2] | 0x20) === 0x70 && // p / P
+      (index[nameEnd - 1] | 0x20) === 0x66; // f / F
+    if (isContainer || isOpf) {
+      const name = strFromU8(index.subarray(nameStart, nameEnd));
+      wanted.set(name, {
+        name,
+        nameLength,
+        method: iv.getUint16(p + 10, true),
+        compressedSize: iv.getUint32(p + 20, true),
+        uncompressedSize: iv.getUint32(p + 24, true),
+        localOffset: iv.getUint32(p + 42, true),
+      });
+    }
+    p += 46 + nameLength + extraLength + commentLength;
+  }
+
+  let opfEntry: ZipEntry | undefined;
+  const container = wanted.get('META-INF/container.xml');
+  if (container) {
+    const path = opfPathFromContainer(strFromU8(await readZipEntry(source, container)));
+    if (path) opfEntry = wanted.get(path) ?? wanted.get(decodeURIComponent(path));
+  }
+  if (!opfEntry) opfEntry = [...wanted.values()].find((e) => e.name.toLowerCase().endsWith('.opf'));
+  if (!opfEntry) return {};
+
+  return parseEpubPackage(strFromU8(await readZipEntry(source, opfEntry)));
 }
 
 // ---------- PDF ----------
