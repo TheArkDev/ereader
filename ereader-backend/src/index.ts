@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { hashPassword, verifyPassword, signToken, verifyToken } from './auth';
 import { extractEpubCover } from './epubCover';
-import { readEpubMetadata, readPdfMetadata, titleRelation, confidenceFor } from './bookMetadata';
+import { readEpubMetadata, readEpubMetadataRanged, readPdfMetadata, titleRelation, confidenceFor } from './bookMetadata';
 
 export interface Env {
   DB: D1Database;
@@ -33,7 +33,7 @@ async function requireAuth(c: any, next: any) {
 
   // Checked on every request (not just at login) so disabling an account
   // takes effect immediately, even for a token issued before the disable.
-  const user = await c.env.DB.prepare('SELECT is_disabled FROM users WHERE id = ?')
+  const user = await (c.env.DB as D1Database).prepare('SELECT is_disabled FROM users WHERE id = ?')
     .bind(payload.userId)
     .first<{ is_disabled: number }>();
   if (!user || user.is_disabled === 1) return c.json({ error: 'Account disabled' }, 403);
@@ -48,7 +48,7 @@ async function requireAuth(c: any, next: any) {
 // request rather than trusting anything from the JWT, so revoking admin
 // takes effect immediately without needing new tokens.
 async function requireAdmin(c: any, next: any) {
-  const user = await c.env.DB.prepare('SELECT is_admin FROM users WHERE id = ?')
+  const user = await (c.env.DB as D1Database).prepare('SELECT is_admin FROM users WHERE id = ?')
     .bind(c.get('userId'))
     .first<{ is_admin: number }>();
   if (!user || user.is_admin !== 1) return c.json({ error: 'Admin access required' }, 403);
@@ -159,12 +159,22 @@ app.post('/auth/change-password', requireAuth, async (c) => {
   return c.json({ ok: true });
 });
 
-// ---------- Password reset ----------
-// Flow: app calls POST /auth/forgot-password -> we email a link that opens
-// GET /reset-password?token=... (a plain HTML page served by this same
-// Worker, since the app has no custom domain to deep-link into) -> the
-// person sets a new password there -> POST /reset-password completes it.
-// Reset tokens live in KV with a 1-hour TTL and are single-use.
+// ---------- Password reset (6-digit code) ----------
+// Flow: the app calls POST /auth/forgot-password with the email; we email a
+// 6-digit code that works for 15 minutes. The app then calls
+// POST /auth/reset-password with { email, code, newPassword }.
+//
+// Only a hash of the code is kept (in KV), wrong guesses are counted, and five
+// wrong guesses destroy the code — so it can't be brute-forced — and a new code
+// can't be requested more than once a minute.
+
+// The address reset emails come from. It must be on a domain you have verified
+// in Resend, or Resend will refuse to send to anyone but your own account.
+const EMAIL_FROM = 'ereader <noreply@dominionlib.dpdns.org>';
+
+const RESET_CODE_TTL_SECONDS = 15 * 60;
+const RESET_RESEND_COOLDOWN_SECONDS = 60; // KV's minimum expirationTtl is 60
+const RESET_MAX_ATTEMPTS = 5;
 
 async function sendEmail(env: Env, to: string, subject: string, html: string): Promise<void> {
   console.log(`[sendEmail] calling Resend API, key present: ${env.RESEND_API_KEY ? 'yes (' + env.RESEND_API_KEY.slice(0, 5) + '...)' : 'NO — RESEND_API_KEY IS EMPTY'}`);
@@ -175,17 +185,7 @@ async function sendEmail(env: Env, to: string, subject: string, html: string): P
         Authorization: `Bearer ${env.RESEND_API_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        // Was 'ereader <onboarding@resend.dev>' (Resend's shared testing
-        // sender, which only delivers to your own Resend signup email —
-        // that's why early reset emails silently never arrived for other
-        // accounts). Now using the verified dominionlib.dpdns.org domain,
-        // which can send to any recipient.
-        from: 'ereader <noreply@dominionlib.dpdns.org>',
-        to,
-        subject,
-        html,
-      }),
+      body: JSON.stringify({ from: EMAIL_FROM, to, subject, html }),
     });
     const responseText = await res.text();
     if (!res.ok) {
@@ -198,107 +198,133 @@ async function sendEmail(env: Env, to: string, subject: string, html: string): P
   }
 }
 
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** A random 6-digit code, 100000–999999, with no modulo bias. */
+function newResetCode(): string {
+  const limit = Math.floor(0x100000000 / 900000) * 900000;
+  const buf = new Uint32Array(1);
+  do {
+    crypto.getRandomValues(buf);
+  } while (buf[0] >= limit);
+  return String(100000 + (buf[0] % 900000));
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+type ResetRecord = { hash: string; attempts: number; expiresAt: number };
+
 app.post('/auth/forgot-password', async (c) => {
-  const body = await c.req.json<{ email?: string }>();
+  const body = await c.req.json<{ email?: string }>().catch(() => ({}) as { email?: string });
   const email = body.email?.trim().toLowerCase();
   console.log(`[forgot-password] request for: ${email ?? '(empty)'}`);
 
-  // Always respond the same way whether or not the email exists, so this
+  // Always answer the same way whether or not the email exists, so this
   // endpoint can't be used to discover which emails are registered.
-  const genericResponse = c.json({ message: 'If that email is registered, a reset link has been sent.' });
-  if (!email) {
-    console.log('[forgot-password] no email in request body — stopping here');
-    return genericResponse;
+  const generic = { message: 'If that email is registered, a verification code has been sent.' };
+  if (!email) return c.json(generic);
+
+  const user = await c.env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first<{ id: string }>();
+  if (!user) {
+    console.log(`[forgot-password] no user found for "${email}" — nothing sent`);
+    return c.json(generic);
+  }
+
+  // A code went out a moment ago: don't send another, so this can't be used to flood an inbox.
+  if (await c.env.KV.get(`resetcool:${email}`)) {
+    console.log(`[forgot-password] cooldown active for "${email}" — not sending again`);
+    return c.json(generic);
+  }
+
+  const code = newResetCode();
+  const record: ResetRecord = {
+    hash: await sha256Hex(`${code}:${email}:${c.env.JWT_SECRET}`),
+    attempts: 0,
+    expiresAt: Date.now() + RESET_CODE_TTL_SECONDS * 1000,
+  };
+  await c.env.KV.put(`resetcode:${email}`, JSON.stringify(record), { expirationTtl: RESET_CODE_TTL_SECONDS });
+  await c.env.KV.put(`resetcool:${email}`, '1', { expirationTtl: RESET_RESEND_COOLDOWN_SECONDS });
+
+  await sendEmail(
+    c.env,
+    email,
+    'Your ereader verification code',
+    `<p>Your verification code is:</p>
+     <p style="font-size:28px;font-weight:700;letter-spacing:6px">${code}</p>
+     <p>It expires in 15 minutes. If you didn't request a password reset, you can safely ignore this email.</p>`
+  );
+  return c.json(generic);
+});
+
+app.post('/auth/reset-password', async (c) => {
+  const body = await c.req
+    .json<{ email?: string; code?: string; newPassword?: string }>()
+    .catch(() => ({}) as { email?: string; code?: string; newPassword?: string });
+  const email = body.email?.trim().toLowerCase();
+  const code = body.code?.trim();
+  const newPassword = body.newPassword;
+
+  if (!email || !code || !newPassword) return c.json({ error: 'Email, code and new password are required' }, 400);
+  if (newPassword.length < 8) return c.json({ error: 'Password must have at least 8 characters' }, 400);
+
+  const invalidOrExpired = () => c.json({ error: 'That code is invalid or has expired. Request a new one.' }, 400);
+  const tooMany = () => c.json({ error: 'Too many wrong attempts. Request a new code.' }, 429);
+
+  const key = `resetcode:${email}`;
+  const raw = await c.env.KV.get(key);
+  if (!raw) return invalidOrExpired();
+
+  let record: ResetRecord;
+  try {
+    record = JSON.parse(raw) as ResetRecord;
+  } catch {
+    await c.env.KV.delete(key);
+    return invalidOrExpired();
+  }
+  if (Date.now() > record.expiresAt) {
+    await c.env.KV.delete(key);
+    return invalidOrExpired();
+  }
+  if (record.attempts >= RESET_MAX_ATTEMPTS) {
+    await c.env.KV.delete(key);
+    return tooMany();
+  }
+
+  const submitted = await sha256Hex(`${code}:${email}:${c.env.JWT_SECRET}`);
+  if (!timingSafeEqual(submitted, record.hash)) {
+    record.attempts += 1;
+    if (record.attempts >= RESET_MAX_ATTEMPTS) {
+      await c.env.KV.delete(key);
+      return tooMany();
+    }
+    const secondsLeft = Math.max(60, Math.ceil((record.expiresAt - Date.now()) / 1000));
+    await c.env.KV.put(key, JSON.stringify(record), { expirationTtl: secondsLeft });
+    return c.json({ error: 'That code is incorrect.' }, 400);
   }
 
   const user = await c.env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first<{ id: string }>();
   if (!user) {
-    console.log(`[forgot-password] no user found for "${email}" — stopping here (this is the #1 suspect if no email ever arrives)`);
-    return genericResponse;
+    await c.env.KV.delete(key);
+    return invalidOrExpired();
   }
 
-  console.log(`[forgot-password] user found (id=${user.id}), generating token and emailing`);
-  const token = crypto.randomUUID();
-  await c.env.KV.put(`reset:${token}`, user.id, { expirationTtl: 3600 }); // 1 hour
-
-  const resetUrl = `${new URL(c.req.url).origin}/reset-password?token=${token}`;
-  await sendEmail(
-    c.env,
-    email,
-    'Reset your ereader password',
-    `<p>Someone requested a password reset for this email's ereader account.</p>
-     <p><a href="${resetUrl}">Click here to set a new password</a> (link expires in 1 hour).</p>
-     <p>If you didn't request this, you can safely ignore this email.</p>`
-  );
-
-  return genericResponse;
-});
-
-const RESET_PAGE_STYLES = `
-  body { font-family: Georgia, serif; background: #FBF8F3; color: #1B1B1F; display: flex;
-         justify-content: center; padding: 48px 20px; }
-  .card { max-width: 380px; width: 100%; }
-  h1 { font-size: 22px; margin-bottom: 8px; }
-  p { color: #5c5850; font-size: 14px; }
-  input { width: 100%; padding: 12px 14px; margin-top: 6px; margin-bottom: 16px; border-radius: 10px;
-          border: 1px solid rgba(0,0,0,0.15); font-size: 15px; box-sizing: border-box; }
-  label { font-size: 13px; font-weight: 600; }
-  button { width: 100%; padding: 14px; border-radius: 10px; border: none; background: #5E3B26;
-           color: white; font-size: 15px; font-weight: 600; cursor: pointer; }
-  .error { color: #b3261e; font-size: 13px; margin-bottom: 12px; }
-`;
-
-app.get('/reset-password', async (c) => {
-  const token = c.req.query('token') ?? '';
-  const userId = token ? await c.env.KV.get(`reset:${token}`) : null;
-
-  if (!userId) {
-    return c.html(`<html><head><style>${RESET_PAGE_STYLES}</style></head><body><div class="card">
-      <h1>Link expired</h1>
-      <p>This password reset link is invalid or has expired. Go back to the app and request a new one.</p>
-    </div></body></html>`);
-  }
-
-  return c.html(`<html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>${RESET_PAGE_STYLES}</style></head><body><div class="card">
-    <h1>Set a new password</h1>
-    <p>Choose a new password for your ereader account.</p>
-    <form method="POST" action="/reset-password">
-      <input type="hidden" name="token" value="${token}">
-      <label>New password</label>
-      <input type="password" name="password" minlength="8" required>
-      <button type="submit">Reset password</button>
-    </form>
-  </div></body></html>`);
-});
-
-app.post('/reset-password', async (c) => {
-  const form = await c.req.formData();
-  const token = form.get('token') as string | null;
-  const password = form.get('password') as string | null;
-
-  const userId = token ? await c.env.KV.get(`reset:${token}`) : null;
-
-  if (!userId) {
-    return c.html(`<html><head><style>${RESET_PAGE_STYLES}</style></head><body><div class="card">
-      <h1>Link expired</h1><p>Go back to the app and request a new reset link.</p>
-    </div></body></html>`);
-  }
-  if (!password || password.length < 8) {
-    return c.html(`<html><head><style>${RESET_PAGE_STYLES}</style></head><body><div class="card">
-      <h1>Password too short</h1><p>Use the link in your email again and choose a password with at least 8 characters.</p>
-    </div></body></html>`);
-  }
-
-  const { hash, salt } = await hashPassword(password);
+  const { hash, salt } = await hashPassword(newPassword);
   await c.env.DB.prepare('UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?')
-    .bind(hash, salt, userId)
+    .bind(hash, salt, user.id)
     .run();
-  await c.env.KV.delete(`reset:${token}`); // single-use
 
-  return c.html(`<html><head><style>${RESET_PAGE_STYLES}</style></head><body><div class="card">
-    <h1>Password updated</h1><p>You can now log in with your new password in the app.</p>
-  </div></body></html>`);
+  // The code is single-use.
+  await c.env.KV.delete(key);
+  await c.env.KV.delete(`resetcool:${email}`);
+  return c.json({ ok: true });
 });
 
 // ---------- Book routes ----------
@@ -356,7 +382,7 @@ app.get('/books', requireAuth, async (c) => {
   const where = conditions.length ? ' WHERE ' + conditions.join(' AND ') : '';
 
   const orderParts: string[] = [];
- if (coverFirst) orderParts.push(ATTENTION_ORDER_SQL); // 0 = no cover, so those come first
+  if (coverFirst) orderParts.push(ATTENTION_ORDER_SQL);
   switch (sort) {
     case 'title':
       orderParts.push('LOWER(title) ASC');
@@ -777,6 +803,7 @@ const BOOK_COLUMNS = 'id, title, author, description, format, cover_key, categor
 
 // A book "needs attention" if anything an admin would want filled in is empty.
 const NEEDS_ATTENTION_SQL = `(cover_key IS NULL OR ${isBlankSql('author')} OR ${isBlankSql('category')} OR ${isBlankSql('description')})`;
+
 // Groups of live books sharing the same title + author (ignoring case and
 // surrounding spaces) — the same rule the edit screen enforces.
 const DUPLICATE_GROUPS_SQL =
@@ -895,12 +922,12 @@ app.get('/admin/books', requireAuth, requireAdmin, async (c) => {
 
   let from = 'books b';
   let extraSelect = '';
-  let order = ATTENTION_ORDER_SQL + ', created_at DESC, id ASC';// no cover first
+  let order = ATTENTION_ORDER_SQL + ', created_at DESC, id ASC';
   if (filter === 'needs') {
     where.push(NEEDS_ATTENTION_SQL);
-    } else if (filter === 'pdfcover') {
+  } else if (filter === 'pdfcover') {
     where.push("format = 'pdf' AND cover_key IS NULL");
-    } else if (filter === 'uncategorized') {
+  } else if (filter === 'uncategorized') {
     where.push(isBlankSql('category'));
   } else if (filter === 'categorized') {
     where.push(`NOT ${isBlankSql('category')}`);
@@ -961,11 +988,6 @@ app.get('/admin/books/duplicate-extras', requireAuth, requireAdmin, async (c) =>
   return c.json({ ids: results.map((r) => r.id) });
 });
 
-// ---------- Admin: book metrics ----------
-
-
-
-
 // ---------- Admin: read author/description from inside the book files ----------
 // For up to 5 books at a time, opens the actual PDF/EPUB in storage and reports
 // what's written inside it. Read-only: nothing is saved here — the app shows
@@ -991,12 +1013,32 @@ app.post('/admin/books/read-metadata', requireAuth, requireAdmin, async (c) => {
       let meta: ReturnType<typeof readEpubMetadata>;
 
       if (isEpub) {
-        const object = await c.env.FILES.get(book.file_key);
-        if (!object) {
+        // Never load the whole book: a big EPUB would blow the Worker's CPU/memory
+        // limit (Cloudflare then answers 503). Read just its zip index and the two
+        // tiny files inside it that hold the details.
+        const info = await c.env.FILES.head(book.file_key);
+        if (!info) {
           out.push({ id: book.id, error: 'The file is missing from storage' });
           continue;
         }
-        meta = readEpubMetadata(new Uint8Array(await object.arrayBuffer()));
+        const source = {
+          size: info.size,
+          read: async (offset: number, length: number): Promise<Uint8Array> => {
+            const end = Math.min(info.size, offset + length);
+            if (end <= offset) return new Uint8Array(0);
+            const part = await c.env.FILES.get(book.file_key, { range: { offset, length: end - offset } });
+            return part ? new Uint8Array(await part.arrayBuffer()) : new Uint8Array(0);
+          },
+        };
+        try {
+          meta = await readEpubMetadataRanged(source);
+        } catch (err) {
+          // An unusual zip (e.g. ZIP64)? A small book can still be read whole; a big one can't, safely.
+          if (info.size > 8 * 1024 * 1024) throw err;
+          const whole = await c.env.FILES.get(book.file_key);
+          if (!whole) throw err;
+          meta = readEpubMetadata(new Uint8Array(await whole.arrayBuffer()));
+        }
       } else {
         const head = await c.env.FILES.get(book.file_key, { range: { offset: 0, length: CHUNK } });
         if (!head) {
