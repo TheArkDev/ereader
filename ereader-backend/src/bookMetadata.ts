@@ -12,9 +12,14 @@ import { inflateSync, strFromU8, unzipSync } from 'fflate';
 // Everything here is plain functions on bytes, so it runs the same in the
 // Worker and in a test.
 
+/** Where a description came from: the file's own field (trustworthy), a page
+ *  in the book that is the blurb, or just the book's opening text (a stand-in). */
+export type DescriptionSource = 'metadata' | 'blurb' | 'opening';
+
 export interface FileMetadata {
   author?: string;
   description?: string;
+  descriptionSource?: DescriptionSource;
   title?: string;
 }
 
@@ -76,24 +81,30 @@ export function cleanAuthor(raw: string | undefined | null): string | undefined 
   return a;
 }
 
-const PLACEHOLDER_TEXT = new Set(['na', 'n/a', 'n.a.', 'none', 'null', 'nil', '-', '--', 'unknown', 'not available', 'tbd']);
+// Compared with case, dots, slashes and spaces removed, so "N/A", "n.a." and "Not Available" are all caught.
+const PLACEHOLDER_TEXT = new Set([
+  'na', 'none', 'null', 'nil', '-', '--', '\u2013', '\u2014', 'unknown', 'notavailable', 'notapplicable', 'tbd',
+  'nodescription', 'nodescriptionavailable', 'descriptionnotavailable', 'nodata',
+]);
 
 /** A tidy description, or undefined if it's missing, a placeholder, or too short to mean anything. */
 export function cleanDescription(raw: string | undefined | null, title?: string): string | undefined {
   if (!raw) return undefined;
   let t = htmlToText(raw);
   if (t.length < 40) return undefined;
-  if (PLACEHOLDER_TEXT.has(t.toLowerCase())) return undefined;
+  if (PLACEHOLDER_TEXT.has(t.toLowerCase().replace(/[.\/\s]/g, ''))) return undefined;
   if (/^(https?:\/\/|www\.)\S+$/i.test(t)) return undefined;
   if (title && t.toLowerCase() === title.trim().toLowerCase()) return undefined;
 
-  const MAX = 1500;
-  if (t.length > MAX) {
-    const window = t.slice(0, MAX);
-    const end = Math.max(window.lastIndexOf('. '), window.lastIndexOf('! '), window.lastIndexOf('? '));
-    t = end > 500 ? window.slice(0, end + 1) : window.trimEnd() + '\u2026';
-  }
-  return t;
+  return capAtSentence(t, 1500, 500);
+}
+
+/** Shortens [text] to about [max] characters, ending on a full sentence when it can. */
+function capAtSentence(text: string, max: number, minEnd: number): string {
+  if (text.length <= max) return text;
+  const window = text.slice(0, max);
+  const end = Math.max(window.lastIndexOf('. '), window.lastIndexOf('! '), window.lastIndexOf('? '));
+  return end > minEnd ? window.slice(0, end + 1) : window.trimEnd() + '\u2026';
 }
 
 /** A title worth comparing against, or undefined for placeholder titles that
@@ -140,6 +151,79 @@ export function confidenceFor(format: 'epub' | 'pdf', relation: 'match' | 'misma
   return relation === 'none' ? 'medium' : 'low';
 }
 
+// ---------- is the library's title right? ----------
+
+export type TitleVerdict = 'match' | 'better' | 'conflict' | 'none';
+
+export interface TitleAssessment {
+  verdict: TitleVerdict;
+  /** The title from the file, tidied — present for 'better' and 'conflict'. */
+  proposed?: string;
+  confidence?: Confidence;
+  reason?: string;
+}
+
+// Words that show up when a title was made from a download filename.
+const JUNKY_TITLE = /\b(z-?lib(?:rary)?|libgen|pdfdrive|scribd|torrent|ebook|e-book|epub|pdf|mobi|azw3?|scan(?:ned)?|ocr|www|copy of)\b|\.(com|org|net)\b|\([^)]*\)|\[[^\]]*\]|_/i;
+
+/** "THE SCREWTAPE LETTERS" -> "The Screwtape Letters". Only touches titles that are shouted. */
+function tidyCase(title: string): string {
+  const letters = title.replace(/[^\p{L}]/gu, '');
+  if (letters.length < 4) return title;
+  const upper = letters.replace(/[^\p{Lu}]/gu, '').length;
+  if (upper / letters.length < 0.9) return title;
+  const small = new Set(['a', 'an', 'the', 'and', 'or', 'of', 'in', 'on', 'to', 'for', 'at', 'by', 'with']);
+  return title
+    .toLowerCase()
+    .split(/(\s+)/)
+    .map((part, i) => (/\s+/.test(part) || part === '' ? part : i > 0 && small.has(part) ? part : part[0].toUpperCase() + part.slice(1)))
+    .join('');
+}
+
+/** Compares the title the library holds with the title written inside the file,
+ *  and says whether to leave it, replace it, or let a person decide. */
+export function assessTitle(libraryTitle: string, fileTitleRaw: string | undefined): TitleAssessment {
+  const fileTitle = cleanTitle(fileTitleRaw);
+  if (!fileTitle) return { verdict: 'none' };
+
+  const library = libraryTitle.trim();
+  const a = titleTokens(library);
+  const b = titleTokens(fileTitle);
+  if (a.size === 0 || b.size === 0) return { verdict: 'none' };
+
+  const libraryInFile = [...a].every((t) => b.has(t)); // the library's words are all in the file's title
+  const fileInLibrary = [...b].every((t) => a.has(t)); // the file's words are all in the library's title
+  const junky = JUNKY_TITLE.test(library);
+  const proposed = tidyCase(fileTitle.replace(/\s+/g, ' ').trim());
+
+  // Same words (case, punctuation, "the" aside), or the library holds the main title
+  // and the file adds a subtitle: the library's title is fine.
+  if (libraryInFile) return { verdict: 'match' };
+
+  // The library's title has extra words (a filename leftover, the author's name…)
+  // around what the file says. Don't shorten a title to a single word, though —
+  // that's more likely the main title of a longer one — unless it's clearly junk.
+  if (fileInLibrary) {
+    if (b.size < 2 && !junky) return { verdict: 'match' };
+    return junky
+      ? { verdict: 'better', proposed, confidence: 'high', reason: 'The current title looks like a download filename' }
+      : { verdict: 'better', proposed, confidence: 'medium', reason: 'The current title has extra words the book itself doesn\'t' };
+  }
+
+  let shared = 0;
+  for (const t of a) if (b.has(t)) shared++;
+  const overlap = shared / Math.min(a.size, b.size);
+  if (overlap >= 0.5) {
+    return { verdict: 'conflict', proposed, confidence: junky ? 'medium' : 'low', reason: 'The wording differs — check which is right' };
+  }
+  return {
+    verdict: 'conflict',
+    proposed,
+    confidence: 'low',
+    reason: 'The title inside the file is quite different — it may be leftover from another book, or the wrong file',
+  };
+}
+
 // ---------- EPUB ----------
 
 function firstTag(xml: string, name: string): string | undefined {
@@ -173,7 +257,10 @@ export function parseEpubPackage(xml: string): FileMetadata {
   const result: FileMetadata = {};
   if (authors.length > 0) result.author = authors.slice(0, 3).join(', ');
   const description = cleanDescription(firstTag(metadata, 'description'), title);
-  if (description) result.description = description;
+  if (description) {
+    result.description = description;
+    result.descriptionSource = 'metadata';
+  }
   if (title) result.title = title;
   return result;
 }
@@ -231,8 +318,8 @@ const MAX_METADATA_FILE = 3 * 1024 * 1024; // an .opf is a few KB; refuse anythi
 const MAX_ZIP_INDEX = 8 * 1024 * 1024;
 const TAIL_BYTES = 256 * 1024;
 
-async function readZipEntry(source: RangedSource, entry: ZipEntry): Promise<Uint8Array> {
-  if (entry.compressedSize > MAX_METADATA_FILE || entry.uncompressedSize > MAX_METADATA_FILE) {
+async function readZipEntry(source: RangedSource, entry: ZipEntry, maxSize = MAX_METADATA_FILE): Promise<Uint8Array> {
+  if (entry.compressedSize > maxSize || entry.uncompressedSize > maxSize) {
     throw new Error(`${entry.name} is unexpectedly large`);
   }
   // One read normally covers the entry's local header and its data. The local
@@ -254,7 +341,173 @@ async function readZipEntry(source: RangedSource, entry: ZipEntry): Promise<Uint
   throw new Error(`Unsupported zip compression (${entry.method})`);
 }
 
-export async function readEpubMetadataRanged(source: RangedSource): Promise<FileMetadata> {
+/** Walks the zip index, keeping the entries [want] accepts (judged from the raw name bytes). */
+function scanZipIndex(index: Uint8Array, want: (nameStart: number, nameEnd: number) => boolean): Map<string, ZipEntry> {
+  const found = new Map<string, ZipEntry>();
+  const iv = new DataView(index.buffer, index.byteOffset, index.byteLength);
+  let p = 0;
+  while (p + 46 <= index.length && iv.getUint32(p, true) === 0x02014b50) {
+    const nameLength = iv.getUint16(p + 28, true);
+    const extraLength = iv.getUint16(p + 30, true);
+    const commentLength = iv.getUint16(p + 32, true);
+    const nameStart = p + 46;
+    const nameEnd = nameStart + nameLength;
+    if (want(nameStart, nameEnd)) {
+      const name = strFromU8(index.subarray(nameStart, nameEnd));
+      found.set(name, {
+        name,
+        nameLength,
+        method: iv.getUint16(p + 10, true),
+        compressedSize: iv.getUint32(p + 20, true),
+        uncompressedSize: iv.getUint32(p + 24, true),
+        localOffset: iv.getUint32(p + 42, true),
+      });
+    }
+    p += 46 + nameLength + extraLength + commentLength;
+  }
+  return found;
+}
+
+// ----- finding a description when the file has no description field -----
+
+// A book page that IS the blurb ("About the Book", "Description", "Back cover"…).
+const BLURB_PAGE = /(^|[\/_\-. ])(description|blurb|about[-_ ]?the[-_ ]?book|synopsis|overview|summary|back[-_ ]?cover|jacket|promo)([\/_\-. ]|$)/i;
+// Pages that are never prose worth quoting.
+const NOT_PROSE_PAGE = /(cover|title|copyright|toc|nav|contents|dedicat|acknowledg|epigraph|halftitle|colophon|praise|also-?by|about-?the-?author|author|permissions|imprint)/i;
+// Paragraph content that marks front/back matter.
+const FRONT_MATTER_TEXT = /(copyright|all rights reserved|isbn|published by|library of congress|printed in|first (?:edition|printing)|scripture quotations|permission|dedicat|acknowledg|table of contents|www\.|https?:|\bpraise for\b|about the author)/i;
+
+const MAX_PROSE_FILE = 400 * 1024; // of *uncompressed* text — bigger chapters are skipped, not inflated
+const MAX_PAGES_READ = 5;
+
+/** An XHTML page as plain text, one paragraph per line. */
+function xhtmlToText(html: string): string {
+  let t = html.replace(/<head\b[\s\S]*?<\/head>/gi, ' ').replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, ' ');
+  t = t.replace(/<\/(p|div|h[1-6]|li|blockquote|tr|section)>|<br\s*\/?>/gi, '\n');
+  t = t.replace(/<[^>]+>/g, '');
+  t = decodeEntities(t);
+  return t.replace(/[ \t\u00a0]+/g, ' ').replace(/\s*\n\s*/g, '\n').trim();
+}
+
+/** Drops heading-like lines (short, no closing punctuation) from the top of a page's text. */
+function withoutLeadingHeadings(text: string): string {
+  const lines = text.split('\n');
+  while (lines.length > 0 && lines[0].trim().length < 60 && !/[.!?:]["'\u201d\u2019)]?$/.test(lines[0].trim())) lines.shift();
+  return lines.join('\n').trim();
+}
+
+/** Paragraphs that read like the book's own prose (not headings, credits or lists). */
+function proseParagraphs(text: string): string[] {
+  const out: string[] = [];
+  for (const raw of text.split('\n')) {
+    const p = raw.trim();
+    if (p.length < 140 || p.length > 1500) continue;
+    if (!/[.!?]["'\u201d\u2019)\]]?$/.test(p)) continue;
+    if ((p.match(/[.!?](?:\s|$)/g)?.length ?? 0) < 2) continue;
+    if (FRONT_MATTER_TEXT.test(p)) continue;
+    if ((p.match(/\p{L}/gu)?.length ?? 0) / p.length < 0.75) continue;
+    out.push(p);
+  }
+  return out;
+}
+
+function attrOf(attrs: string, name: string): string | undefined {
+  return new RegExp(`\\b${name}\\s*=\\s*["']([^"']*)["']`, 'i').exec(attrs)?.[1];
+}
+
+function resolveZipPath(dir: string, href: string): string {
+  let clean = href.split('#')[0];
+  try {
+    clean = decodeURIComponent(clean);
+  } catch {
+    // keep it as written
+  }
+  const out: string[] = [];
+  for (const part of (dir + clean).split('/')) {
+    if (part === '..') out.pop();
+    else if (part !== '.' && part !== '') out.push(part);
+  }
+  return out.join('/');
+}
+
+/** The book's reading order: [{id, path}] for each XHTML page in the spine. */
+function spinePages(opfXml: string, opfPath: string): Array<{ id: string; path: string }> {
+  const manifest = new Map<string, { href: string; type: string }>();
+  for (const m of opfXml.matchAll(/<item\b([^>]*)>/gi)) {
+    const id = attrOf(m[1], 'id');
+    const href = attrOf(m[1], 'href');
+    if (id && href) manifest.set(id, { href, type: attrOf(m[1], 'media-type') ?? '' });
+  }
+  const dir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/') + 1) : '';
+  const pages: Array<{ id: string; path: string }> = [];
+  for (const m of opfXml.matchAll(/<itemref\b([^>]*)>/gi)) {
+    const idref = attrOf(m[1], 'idref');
+    if (!idref || /\blinear\s*=\s*["']no["']/i.test(m[1])) continue; // skip non-linear extras (usually the cover)
+    const item = manifest.get(idref);
+    if (!item) continue;
+    if (!/x?html/i.test(item.type) && !/\.x?html?$/i.test(item.href)) continue;
+    pages.push({ id: idref, path: resolveZipPath(dir, item.href) });
+  }
+  return pages;
+}
+
+/** Looks inside the book for something that can stand in for a description:
+ *  first a page that is the blurb, otherwise the opening paragraphs of its prose. */
+async function descriptionFromContent(
+  source: RangedSource,
+  index: Uint8Array,
+  opfXml: string,
+  opfPath: string,
+  title: string | undefined,
+): Promise<{ text: string; source: DescriptionSource } | undefined> {
+  const pages = spinePages(opfXml, opfPath).slice(0, 60);
+  if (pages.length === 0) return undefined;
+  const entries = scanZipIndex(index, () => true); // names of every file, so spine paths can be looked up
+
+  const readPage = async (path: string): Promise<string | undefined> => {
+    const entry = entries.get(path);
+    if (!entry || entry.uncompressedSize > MAX_PROSE_FILE) return undefined;
+    try {
+      return xhtmlToText(strFromU8(await readZipEntry(source, entry, MAX_PROSE_FILE)));
+    } catch {
+      return undefined;
+    }
+  };
+
+  // 1) a page that is the blurb
+  let blurbsRead = 0;
+  for (const page of pages) {
+    if (blurbsRead >= 3) break;
+    if (!BLURB_PAGE.test(page.path) && !BLURB_PAGE.test(page.id)) continue;
+    blurbsRead++;
+    const text = await readPage(page.path);
+    if (!text || /about the author|praise for|table of contents/i.test(text)) continue;
+    const cleaned = cleanDescription(withoutLeadingHeadings(text), title);
+    if (cleaned) return { text: cleaned, source: 'blurb' };
+  }
+
+  // 2) the opening paragraphs of real prose
+  const paragraphs: string[] = [];
+  let pagesRead = 0;
+  for (const page of pages) {
+    if (pagesRead >= MAX_PAGES_READ) break;
+    const entry = entries.get(page.path);
+    if (!entry || entry.uncompressedSize < 300 || entry.uncompressedSize > MAX_PROSE_FILE) continue;
+    if (NOT_PROSE_PAGE.test(page.path) || NOT_PROSE_PAGE.test(page.id)) continue;
+    pagesRead++;
+    const text = await readPage(page.path);
+    if (!text) continue;
+    for (const p of proseParagraphs(text)) {
+      paragraphs.push(p);
+      if (paragraphs.join('\n').length >= 300) break;
+    }
+    if (paragraphs.join('\n').length >= 300) break;
+  }
+  if (paragraphs.length === 0) return undefined;
+  return { text: capAtSentence(paragraphs.join('\n'), 700, 250), source: 'opening' };
+}
+
+export async function readEpubMetadataRanged(source: RangedSource, options: { deep?: boolean } = {}): Promise<FileMetadata> {
   if (source.size < 22) throw new Error('Not a valid EPUB (too small)');
 
   const tailLength = Math.min(source.size, TAIL_BYTES);
@@ -285,18 +538,10 @@ export async function readEpubMetadataRanged(source: RangedSource): Promise<File
       ? tail.subarray(indexOffset - tailStart, indexOffset - tailStart + indexSize)
       : await source.read(indexOffset, indexSize);
 
-  // Walk the index, keeping only the entries we care about.
-  const wanted = new Map<string, ZipEntry>();
-  const iv = new DataView(index.buffer, index.byteOffset, index.byteLength);
-  let p = 0;
-  while (p + 46 <= index.length && iv.getUint32(p, true) === 0x02014b50) {
-    const nameLength = iv.getUint16(p + 28, true);
-    const extraLength = iv.getUint16(p + 30, true);
-    const commentLength = iv.getUint16(p + 32, true);
-    const nameStart = p + 46;
-    const nameEnd = nameStart + nameLength;
-    // An EPUB can hold thousands of entries; test the raw bytes and only turn
-    // the two we want into strings (cheap — this runs inside a CPU-limited Worker).
+  // An EPUB can hold thousands of entries; judge the raw name bytes and only turn
+  // the two we want into strings (cheap — this runs inside a CPU-limited Worker).
+  const wanted = scanZipIndex(index, (nameStart, nameEnd) => {
+    const nameLength = nameEnd - nameStart;
     const isContainer = nameLength === 22 && strFromU8(index.subarray(nameStart, nameEnd)) === 'META-INF/container.xml';
     const isOpf =
       nameLength > 4 &&
@@ -304,19 +549,8 @@ export async function readEpubMetadataRanged(source: RangedSource): Promise<File
       (index[nameEnd - 3] | 0x20) === 0x6f && // o / O
       (index[nameEnd - 2] | 0x20) === 0x70 && // p / P
       (index[nameEnd - 1] | 0x20) === 0x66; // f / F
-    if (isContainer || isOpf) {
-      const name = strFromU8(index.subarray(nameStart, nameEnd));
-      wanted.set(name, {
-        name,
-        nameLength,
-        method: iv.getUint16(p + 10, true),
-        compressedSize: iv.getUint32(p + 20, true),
-        uncompressedSize: iv.getUint32(p + 24, true),
-        localOffset: iv.getUint32(p + 42, true),
-      });
-    }
-    p += 46 + nameLength + extraLength + commentLength;
-  }
+    return isContainer || isOpf;
+  });
 
   let opfEntry: ZipEntry | undefined;
   const container = wanted.get('META-INF/container.xml');
@@ -327,7 +561,17 @@ export async function readEpubMetadataRanged(source: RangedSource): Promise<File
   if (!opfEntry) opfEntry = [...wanted.values()].find((e) => e.name.toLowerCase().endsWith('.opf'));
   if (!opfEntry) return {};
 
-  return parseEpubPackage(strFromU8(await readZipEntry(source, opfEntry)));
+  const opfXml = strFromU8(await readZipEntry(source, opfEntry));
+  const result = parseEpubPackage(opfXml);
+
+  if (options.deep && !result.description) {
+    const found = await descriptionFromContent(source, index, opfXml, opfEntry.name, result.title);
+    if (found) {
+      result.description = found.text;
+      result.descriptionSource = found.source;
+    }
+  }
+  return result;
 }
 
 // ---------- PDF ----------
@@ -454,7 +698,10 @@ export function readPdfMetadata(head: Uint8Array, tail?: Uint8Array): FileMetada
   const description =
     cleanDescription(xmpValue(text, 'description'), title) ??
     (infoSubject && infoSubject.length >= 60 ? cleanDescription(infoSubject, title) : undefined);
-  if (description) result.description = description;
+  if (description) {
+    result.description = description;
+    result.descriptionSource = 'metadata';
+  }
   if (title) result.title = title;
   return result;
 }
