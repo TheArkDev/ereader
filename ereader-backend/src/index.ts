@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { hashPassword, verifyPassword, signToken, verifyToken } from './auth';
 import { extractEpubCover } from './epubCover';
-import { readEpubMetadata, readEpubMetadataRanged, readPdfMetadata, titleRelation, confidenceFor } from './bookMetadata';
+import { assessTitle, readEpubMetadata, readEpubMetadataRanged, readPdfMetadata, titleRelation, confidenceFor } from './bookMetadata';
 
 export interface Env {
   DB: D1Database;
@@ -337,10 +337,13 @@ app.post('/auth/reset-password', async (c) => {
 //   limit, offset      – paging (limit capped at 90); response then includes `total`
 // Admin ordering: no cover first, then books that have a cover but no author or
 // description, then everything else.
-// A value counts as "empty" if it's truly blank OR a placeholder someone typed in.
-const BLANK_VALUES_SQL = "('na', 'n/a', 'n.a.', 'none', 'null', 'nil', '-', '--', 'unknown', 'not available', 'tbd')";
+// A value counts as "empty" if it's truly blank OR a placeholder someone typed in
+// ("NA", "N/A", "n.a.", "Not available", "No description"…). Case, dots, slashes and
+// spaces are ignored when comparing, so every spelling of a placeholder is caught.
+const BLANK_VALUES_SQL =
+  "('na', 'none', 'null', 'nil', '-', '--', '\u2013', '\u2014', 'unknown', 'notavailable', 'notapplicable', 'tbd', 'nodescription', 'nodescriptionavailable', 'descriptionnotavailable', 'nodata')";
 const isBlankSql = (column: string) =>
-  `(${column} IS NULL OR TRIM(${column}) = '' OR LOWER(TRIM(${column})) IN ${BLANK_VALUES_SQL})`;
+  `(${column} IS NULL OR TRIM(${column}) = '' OR REPLACE(REPLACE(REPLACE(LOWER(TRIM(${column})), '.', ''), '/', ''), ' ', '') IN ${BLANK_VALUES_SQL})`;
 
 const ATTENTION_ORDER_SQL = `CASE WHEN cover_key IS NULL THEN 0 WHEN ${isBlankSql('author')} OR ${isBlankSql('description')} THEN 1 ELSE 2 END ASC`;
 
@@ -995,8 +998,12 @@ app.get('/admin/books/duplicate-extras', requireAuth, requireAdmin, async (c) =>
 app.post('/admin/books/read-metadata', requireAuth, requireAdmin, async (c) => {
   const body: any = await c.req.json().catch(() => null);
   const ids = body?.ids;
-  if (!Array.isArray(ids) || ids.length === 0 || ids.length > 5 || !ids.every((i: unknown) => typeof i === 'string' && i.length > 0)) {
-    return c.json({ error: 'ids must be 1–5 book ids' }, 400);
+  // "deep" also looks inside an EPUB for a blurb page or its opening text, which
+  // costs more time per book — so fewer books per request.
+  const deep = body?.deep === true;
+  const maxIds = deep ? 2 : 5;
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > maxIds || !ids.every((i: unknown) => typeof i === 'string' && i.length > 0)) {
+    return c.json({ error: `ids must be 1–${maxIds} book ids` }, 400);
   }
   const ph = ids.map(() => '?').join(',');
   const { results } = await c.env.DB.prepare(
@@ -1031,7 +1038,7 @@ app.post('/admin/books/read-metadata', requireAuth, requireAdmin, async (c) => {
           },
         };
         try {
-          meta = await readEpubMetadataRanged(source);
+          meta = await readEpubMetadataRanged(source, { deep });
         } catch (err) {
           // An unusual zip (e.g. ZIP64)? A small book can still be read whole; a big one can't, safely.
           if (info.size > 8 * 1024 * 1024) throw err;
@@ -1055,11 +1062,29 @@ app.post('/admin/books/read-metadata', requireAuth, requireAdmin, async (c) => {
         meta = readPdfMetadata(new Uint8Array(await head.arrayBuffer()), tailBytes);
       }
 
+      // How far to trust what was read: an EPUB's own fields are solid; a PDF's
+      // depend on whether its embedded title agrees with the library's title.
+      const base = confidenceFor(isEpub ? 'epub' : 'pdf', titleRelation(book.title, meta.title));
+      const descriptionConfidence = !meta.description
+        ? null
+        : meta.descriptionSource === 'opening'
+          ? 'low' // the book's opening text is a stand-in, never a real description
+          : meta.descriptionSource === 'blurb' && base === 'high'
+            ? 'medium'
+            : base;
+      const title = assessTitle(book.title, meta.title);
+
       out.push({
         id: book.id,
         author: meta.author ?? null,
+        authorConfidence: meta.author ? base : null,
         description: meta.description ?? null,
-        confidence: confidenceFor(isEpub ? 'epub' : 'pdf', titleRelation(book.title, meta.title)),
+        descriptionSource: meta.descriptionSource ?? null,
+        descriptionConfidence,
+        titleVerdict: title.verdict, // match | better | conflict | none
+        proposedTitle: title.proposed ?? null,
+        titleConfidence: title.confidence ?? null,
+        titleReason: title.reason ?? null,
         source: isEpub ? 'EPUB' : 'PDF',
       });
     } catch (err) {
@@ -1069,9 +1094,13 @@ app.post('/admin/books/read-metadata', requireAuth, requireAdmin, async (c) => {
   return c.json({ results: out });
 });
 
-// Fills in author and/or description for many books at once. Only ever fills a
-// field that is still empty (or a placeholder like "NA") — it never overwrites
-// text someone has written, even if the book was edited while the app was working.
+// Saves what was approved in "Fill from the files". Per book, any of:
+//   author / description — only ever fill a field that is still empty (or a
+//                          placeholder like "NA"), never overwrite written text;
+//   title                — replaces the title ONLY if it is still exactly
+//                          `expectedTitle`, the one the person reviewed, so an edit
+//                          made meanwhile can't be overwritten.
+// `updated` counts books that really changed, not books that were merely matched.
 app.post('/admin/books/bulk-details', requireAuth, requireAdmin, async (c) => {
   const body: any = await c.req.json().catch(() => null);
   const updates = body?.updates;
@@ -1090,14 +1119,22 @@ app.post('/admin/books/bulk-details', requireAuth, requireAdmin, async (c) => {
     if (typeof u?.id !== 'string' || u.id.length === 0) continue;
     const author = clean(u.author, 200);
     const description = clean(u.description, 2000);
-    if (author === null && description === null) continue;
+    const newTitle = clean(u.title, 300);
+    const expectedTitle = typeof u.expectedTitle === 'string' ? u.expectedTitle : null;
+    const title = newTitle !== null && expectedTitle !== null ? newTitle : null;
+    if (author === null && description === null && title === null) continue;
+
     statements.push(
       c.env.DB.prepare(
         `UPDATE books SET
+           title = CASE WHEN ? IS NOT NULL AND title = ? THEN ? ELSE title END,
            author = CASE WHEN ? IS NOT NULL AND ${isBlankSql('author')} THEN ? ELSE author END,
            description = CASE WHEN ? IS NOT NULL AND ${isBlankSql('description')} THEN ? ELSE description END
-         WHERE id = ? AND deleted_at IS NULL`
-      ).bind(author, author, description, description, u.id)
+         WHERE id = ? AND deleted_at IS NULL
+           AND ( (? IS NOT NULL AND title = ?)
+              OR (? IS NOT NULL AND ${isBlankSql('author')})
+              OR (? IS NOT NULL AND ${isBlankSql('description')}) )`
+      ).bind(title, expectedTitle, title, author, author, description, description, u.id, title, expectedTitle, author, description)
     );
   }
   if (statements.length === 0) return c.json({ updated: 0 });
